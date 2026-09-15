@@ -46,8 +46,10 @@ export function createPacket(input = {}) {
   return { ...packet, content_hash: packetHash(packet) }
 }
 
-export function compactPacket(packet, { maxEvidence = 12, maxBytes = null } = {}) {
+export function compactPacketWithReport(packet, { maxEvidence = 12, maxBytes = null } = {}) {
+  if (!Number.isInteger(maxEvidence) || maxEvidence < 0) throw new TypeError('maxEvidence must be a non-negative integer')
   const source = createPacket(packet)
+  const sourceBytes = packetByteLength(source)
   const compacted = {
     ...source,
     evidence_refs: source.evidence_refs.slice(-maxEvidence),
@@ -66,5 +68,21 @@ export function compactPacket(packet, { maxEvidence = 12, maxBytes = null } = {}
     }
   }
 
-  return { ...compacted, content_hash: packetHash(compacted) }
+  const result = { ...compacted, content_hash: packetHash(compacted) }
+  return {
+    packet: result,
+    report: {
+      source_hash: source.content_hash,
+      source_bytes: sourceBytes,
+      output_hash: result.content_hash,
+      output_bytes: packetByteLength(result),
+      dropped_evidence: source.evidence_refs.length - result.evidence_refs.length,
+      dropped_decisions: source.decisions.length - result.decisions.length,
+      max_bytes: maxBytes,
+    },
+  }
+}
+
+export function compactPacket(packet, options = {}) {
+  return compactPacketWithReport(packet, options).packet
 }

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { compactPacket, createPacket } from '../src/context-packet.mjs'
+import { compactPacket, compactPacketWithReport, createPacket } from '../src/context-packet.mjs'
 
 test('packet is deterministic and hash-addressed', () => {
   const a = createPacket({
@@ -60,4 +60,27 @@ test('byte-bounded compaction drops lossy history deterministically', () => {
 test('byte bound fails closed when mandatory facts cannot fit', () => {
   const packet = createPacket({ objective: 'dogfood pods', invariants: ['keep this'], blockers: [], next_actions: [] })
   assert.throws(() => compactPacket(packet, { maxBytes: 10 }), /mandatory context envelope/)
+})
+
+test('compaction report makes loss and byte savings inspectable', () => {
+  const packet = createPacket({
+    objective: 'dogfood pods',
+    invariants: ['settlement is truthful'],
+    blockers: ['terminal receipt missing'],
+    next_actions: ['implement provider observer'],
+    decisions: ['old decision', 'new decision'],
+    evidence_refs: ['old evidence', 'new evidence'],
+  })
+  const { packet: compacted, report } = compactPacketWithReport(packet, { maxEvidence: 0, maxBytes: 430 })
+  assert.equal(report.source_hash, packet.content_hash)
+  assert.equal(report.output_hash, compacted.content_hash)
+  assert.equal(report.output_bytes <= 430, true)
+  assert.equal(report.dropped_evidence, 2)
+  assert.equal(report.dropped_decisions, 0)
+  assert.equal(report.max_bytes, 430)
+})
+
+test('invalid evidence budget fails closed', () => {
+  const packet = createPacket({ objective: 'x', invariants: ['keep'], blockers: [], next_actions: [] })
+  assert.throws(() => compactPacket(packet, { maxEvidence: -1 }), /maxEvidence/)
 })
