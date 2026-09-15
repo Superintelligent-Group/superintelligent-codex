@@ -20,6 +20,8 @@ packet. Codex, Claude Code, and cloud workers can consume the same packet.
 - Provider identity, spend reservation, lease, and session identifiers are
   metadata only and never authorize work by themselves.
 - A missing or malformed packet fails closed.
+- A byte budget may remove only evidence and decision history; if the mandatory
+  envelope cannot fit, compaction fails closed instead of silently dropping it.
 
 ## Thin slice
 
@@ -35,6 +37,10 @@ The next integration is to attach this packet to SUP-1092 work-session
 commands and persist its hash beside the existing command/run/seat lineage.
 The harness does not claim settlement or provider usage; those remain governed
 by the SIG control plane and the provider receipt path.
+
+`compactPacket(packet, { maxBytes })` gives each session a deterministic context
+budget. It drops oldest evidence first and then oldest decisions, while keeping
+the authoritative facts and parent hash lineage intact.
 
 ## Upstream relationship
 

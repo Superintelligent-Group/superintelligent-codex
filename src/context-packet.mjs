@@ -21,6 +21,10 @@ export function packetHash(packet) {
   return createHash('sha256').update(canonical(packet)).digest('hex')
 }
 
+export function packetByteLength(packet) {
+  return Buffer.byteLength(JSON.stringify(packet), 'utf8')
+}
+
 export function createPacket(input = {}) {
   for (const field of REQUIRED) {
     if (!(field in input)) throw new TypeError(`missing ${field}`)
@@ -42,7 +46,7 @@ export function createPacket(input = {}) {
   return { ...packet, content_hash: packetHash(packet) }
 }
 
-export function compactPacket(packet, { maxEvidence = 12 } = {}) {
+export function compactPacket(packet, { maxEvidence = 12, maxBytes = null } = {}) {
   const source = createPacket(packet)
   const compacted = {
     ...source,
@@ -50,6 +54,17 @@ export function compactPacket(packet, { maxEvidence = 12 } = {}) {
     parent_hash: source.content_hash,
   }
   delete compacted.content_hash
+
+  if (maxBytes !== null) {
+    if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new TypeError('maxBytes must be a positive integer')
+    // Evidence and decisions are the only lossy fields. Drop oldest evidence
+    // first, then oldest decisions, while the authoritative fields stay intact.
+    while (packetByteLength({ ...compacted, content_hash: packetHash(compacted) }) > maxBytes) {
+      if (compacted.evidence_refs.length > 0) compacted.evidence_refs.shift()
+      else if (compacted.decisions.length > 0) compacted.decisions.shift()
+      else throw new RangeError('maxBytes is smaller than the mandatory context envelope')
+    }
+  }
+
   return { ...compacted, content_hash: packetHash(compacted) }
 }
-

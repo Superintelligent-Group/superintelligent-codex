@@ -38,3 +38,26 @@ test('compaction retains invariants, blockers, and next actions', () => {
 test('malformed packets fail closed', () => {
   assert.throws(() => createPacket({ objective: 'x', invariants: [], blockers: [] }), /missing next_actions/)
 })
+
+test('byte-bounded compaction drops lossy history deterministically', () => {
+  const packet = createPacket({
+    objective: 'dogfood pods',
+    invariants: ['settlement is truthful'],
+    blockers: ['terminal receipt missing'],
+    next_actions: ['implement provider observer'],
+    decisions: ['old decision', 'new decision'],
+    evidence_refs: ['old evidence', 'new evidence'],
+  })
+  const compacted = compactPacket(packet, { maxBytes: 430 })
+  assert.deepEqual(compacted.invariants, packet.invariants)
+  assert.deepEqual(compacted.blockers, packet.blockers)
+  assert.deepEqual(compacted.next_actions, packet.next_actions)
+  assert.deepEqual(compacted.decisions, ['old decision'])
+  assert.deepEqual(compacted.evidence_refs, [])
+  assert.equal(compacted.parent_hash, packet.content_hash)
+})
+
+test('byte bound fails closed when mandatory facts cannot fit', () => {
+  const packet = createPacket({ objective: 'dogfood pods', invariants: ['keep this'], blockers: [], next_actions: [] })
+  assert.throws(() => compactPacket(packet, { maxBytes: 10 }), /mandatory context envelope/)
+})
