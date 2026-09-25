@@ -3609,6 +3609,40 @@ impl AuthManager {
         Ok(removed)
     }
 
+    /// Stop a process-local API key from shadowing a successful replacement login.
+    pub fn clear_ephemeral_api_key(&self) -> std::io::Result<bool> {
+        let storage = create_auth_storage(
+            self.codex_home.clone(),
+            AuthCredentialsStoreMode::Ephemeral,
+            self.keyring_backend_kind,
+        );
+        let _commit = storage.lock_for_write()?;
+        if storage
+            .load()?
+            .is_some_and(|auth| auth.openai_api_key.is_some() && auth.tokens.is_none())
+        {
+            let removed = storage.delete()?;
+            self.invalidate_pending_auth_reads();
+            Ok(removed)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Remove a process-local login without deleting or revoking shared credentials.
+    pub async fn logout_ephemeral(&self) -> std::io::Result<bool> {
+        self.ensure_logout_allowed()?;
+        let removed = logout(
+            &self.codex_home,
+            AuthCredentialsStoreMode::Ephemeral,
+            self.keyring_backend_kind,
+        )?;
+        self.invalidate_pending_auth_reads();
+        self.clear_external_auth();
+        self.reload().await;
+        Ok(removed)
+    }
+
     pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
         self.ensure_logout_allowed()?;
         let auth_dot_json = self

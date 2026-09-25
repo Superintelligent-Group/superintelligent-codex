@@ -498,13 +498,39 @@ impl AccountRequestProcessor {
             }
         }
 
+        // SIG patch: an app-server API-key login (e.g. from an ACP client such as
+        // Zed's codex-acp) must not clobber a persisted ChatGPT login shared by
+        // every other Codex process on the machine. Keep the key in this
+        // process's ephemeral store instead.
+        let persisted_chatgpt = codex_login::load_auth_dot_json(
+            &self.config.codex_home,
+            self.config.cli_auth_credentials_store_mode,
+            self.config.auth_keyring_backend_kind(),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|auth| auth.tokens.is_some());
+        let store_mode = if persisted_chatgpt {
+            tracing::warn!(
+                "API key login requested while a ChatGPT login is persisted; keeping the API key in memory only"
+            );
+            codex_login::AuthCredentialsStoreMode::Ephemeral
+        } else {
+            self.config.cli_auth_credentials_store_mode
+        };
+
         match login_with_api_key(
             &self.config.codex_home,
             &params.api_key,
-            self.config.cli_auth_credentials_store_mode,
+            store_mode,
             self.config.auth_keyring_backend_kind(),
         ) {
             Ok(()) => {
+                if store_mode != codex_login::AuthCredentialsStoreMode::Ephemeral {
+                    self.auth_manager.clear_ephemeral_api_key().map_err(|err| {
+                        internal_error(format!("failed to clear previous api key: {err}"))
+                    })?;
+                }
                 self.auth_manager.reload().await;
                 self.config_manager.clear_chatgpt_config_loader();
                 Ok(())
@@ -607,6 +633,9 @@ impl AccountRequestProcessor {
                 }
             }
             .map_err(|err| internal_error(format!("failed to save Amazon Bedrock auth: {err}")))?;
+            self.auth_manager.clear_ephemeral_api_key().map_err(|err| {
+                internal_error(format!("failed to clear previous api key: {err}"))
+            })?;
             self.auth_manager.reload().await;
             self.config_manager.clear_chatgpt_config_loader();
             Ok(LoginAccountResponse::AmazonBedrock {})
@@ -1021,6 +1050,12 @@ impl AccountRequestProcessor {
         &self,
         mut payload_v2: AccountLoginCompletedNotification,
     ) {
+        if payload_v2.success
+            && let Err(err) = self.auth_manager.clear_ephemeral_api_key()
+        {
+            payload_v2.success = false;
+            payload_v2.error = Some(format!("failed to clear previous api key: {err}"));
+        }
         if payload_v2.success {
             self.auth_manager.reload().await;
             let auth_changes = self.auth_manager.auth_change_state_receiver();
@@ -1571,6 +1606,34 @@ pub(crate) async fn logout_configured_account(
         .reload_with_cached_auth()
         .await
         .map_err(|err| internal_error(format!("logout failed: {err}")))?;
+    // An API-key login shadowing a shared ChatGPT login owns only its ephemeral store.
+    // Do not run primary or enterprise credential cleanup for the preserved account.
+    let ephemeral_api_key = auth_manager.auth_mode()
+        == Some(codex_protocol::auth::AuthMode::ApiKey)
+        && codex_login::load_auth_dot_json(
+            &fallback_config.codex_home,
+            codex_login::AuthCredentialsStoreMode::Ephemeral,
+            fallback_config.auth_keyring_backend_kind(),
+        )
+        .map_err(|err| internal_error(format!("logout failed: {err}")))?
+        .is_some_and(|auth| auth.openai_api_key.is_some());
+    let persisted_chatgpt = ephemeral_api_key
+        && fallback_config.cli_auth_credentials_store_mode
+            != codex_login::AuthCredentialsStoreMode::Ephemeral
+        && codex_login::load_auth_dot_json(
+            &fallback_config.codex_home,
+            fallback_config.cli_auth_credentials_store_mode,
+            fallback_config.auth_keyring_backend_kind(),
+        )
+        .map_err(|err| internal_error(format!("logout failed: {err}")))?
+        .is_some_and(|auth| auth.tokens.is_some());
+    if ephemeral_api_key && persisted_chatgpt {
+        auth_manager
+            .logout_ephemeral()
+            .await
+            .map_err(|err| internal_error(format!("logout failed: {err}")))?;
+        return Ok(fallback_config.clone());
+    }
     config_manager.update_managed_config_loader(Arc::clone(auth_manager), fallback_config);
     let config = config_manager
         .load_latest_config(/*fallback_cwd*/ None)
