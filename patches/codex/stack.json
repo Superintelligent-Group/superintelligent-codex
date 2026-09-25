@@ -1,0 +1,39 @@
+{
+  "fork": "https://github.com/Superintelligent-Group/superintelligent-codex",
+  "upstream": "https://github.com/openai/codex",
+  "base": {
+    "tag": "rust-v0.157.0",
+    "commit": "00c972ed5d6ff6499317fd41b7f23605b8e6850d"
+  },
+  "branch": "sig/0.157.0",
+  "patches": [
+    {
+      "subject": "Suppress console windows when spawning the code-mode host on Windows (#48138)",
+      "kind": "backport",
+      "upstream": "17f37f5",
+      "reason": "Code-mode host opened a visible console window per spawn on Windows.",
+      "drop_when": "Base release contains upstream #48138."
+    },
+    {
+      "subject": "Allow Windows daemon launches with residual job membership (#48157)",
+      "kind": "backport",
+      "upstream": "8b78f47",
+      "reason": "0.157.0 refuses to start the app-server daemon when the host shell sits in a breakaway-OK Job Object (openai/codex#48016).",
+      "drop_when": "Base release contains upstream #48157."
+    },
+    {
+      "subject": "Suppress console windows for local Windows MCP servers (#48238)",
+      "kind": "backport",
+      "upstream": "4b9e0cc",
+      "reason": "Every stdio MCP server opened its own console window on Windows. Conflict resolved against 0.157.0 by keeping DescriptorPolicy::StdioOnly.",
+      "drop_when": "Base release contains upstream #48238."
+    },
+    {
+      "subject": "app-server: keep API-key logins ephemeral when a ChatGPT login is persisted",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "ACP clients (Zed codex-acp) call account/login {type: apiKey}, which overwrote the shared ~/.codex/auth.json and broke the ChatGPT login for the CLI and daemon (401 Incorrect API key against chatgpt.com).",
+      "drop_when": "Upstream fixes the auth.json clobber; tracked by docs/upstream-issues/app-server-apikey-clobbers-chatgpt-auth.md."
+    }
+  ]
+}
