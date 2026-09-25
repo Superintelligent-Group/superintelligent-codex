@@ -445,10 +445,31 @@ impl AccountRequestProcessor {
             }
         }
 
+        // SIG patch: an app-server API-key login (e.g. from an ACP client such as
+        // Zed's codex-acp) must not clobber a persisted ChatGPT login shared by
+        // every other Codex process on the machine. Keep the key in this
+        // process's ephemeral store instead.
+        let persisted_chatgpt = codex_login::load_auth_dot_json(
+            &self.config.codex_home,
+            self.config.cli_auth_credentials_store_mode,
+            self.config.auth_keyring_backend_kind(),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|auth| auth.tokens.is_some());
+        let store_mode = if persisted_chatgpt {
+            tracing::warn!(
+                "API key login requested while a ChatGPT login is persisted; keeping the API key in memory only"
+            );
+            codex_login::AuthCredentialsStoreMode::Ephemeral
+        } else {
+            self.config.cli_auth_credentials_store_mode
+        };
+
         match login_with_api_key(
             &self.config.codex_home,
             &params.api_key,
-            self.config.cli_auth_credentials_store_mode,
+            store_mode,
             self.config.auth_keyring_backend_kind(),
         ) {
             Ok(()) => {
