@@ -161,7 +161,8 @@ async fn refreshing_retained_originators_keeps_catalog_notifications_isolated() 
         .await;
     let root_updates = root.model_catalog_updates().unwrap();
     let work_updates = work.model_catalog_updates().unwrap();
-    root.originator_managers
+    root.inner
+        .originator_managers
         .lock()
         .unwrap()
         .insert(ModelCatalogOriginator::WorkDesktop, work.clone());
@@ -179,5 +180,5 @@ async fn refreshing_retained_originators_keeps_catalog_notifications_isolated() 
     assert!(work_updates.has_changed().unwrap());
     assert_eq!(root_endpoint.fetch_count(), 1);
     assert_eq!(work_endpoint.fetch_count(), 1);
-    assert_eq!(root.originator_managers.lock().unwrap().len(), 1);
+    assert_eq!(root.inner.originator_managers.lock().unwrap().len(), 1);
 }
