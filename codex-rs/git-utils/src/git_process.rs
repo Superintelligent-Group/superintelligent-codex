@@ -1,5 +1,7 @@
 use std::process::Output;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
@@ -29,7 +31,17 @@ impl Drop for KillGitProcessTreeOnDrop {
     }
 }
 
+static GIT_COMMAND_SPAWNS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of internal `git` processes this crate has attempted to spawn in the
+/// current process. Used to measure per-turn Git overhead.
+#[doc(hidden)]
+pub fn git_command_spawn_count() -> u64 {
+    GIT_COMMAND_SPAWNS.load(Ordering::Relaxed)
+}
+
 fn spawn_git_command(command: &mut Command) -> Option<(Child, KillGitProcessTreeOnDrop)> {
+    GIT_COMMAND_SPAWNS.fetch_add(1, Ordering::Relaxed);
     scrub_non_inheritable_env_vars(command.as_std_mut());
     #[cfg(unix)]
     command.process_group(0);

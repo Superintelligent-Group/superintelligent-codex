@@ -14,6 +14,8 @@ use ts_rs::TS;
 use crate::GitSha;
 use crate::SanitizedGitUrl;
 use crate::git_process::run_git_command_with_timeout_output;
+use crate::metadata_cache::MetadataKind;
+use crate::metadata_cache::cached_git_metadata;
 
 /// Return `true` if the project folder specified by the `Config` is inside a
 /// Git repository.
@@ -64,6 +66,14 @@ pub struct GitDiffToRemote {
 /// Uses timeouts to prevent freezing on large repositories.
 /// All git commands (except the initial repo check) run in parallel for better performance.
 pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
+    let owned_cwd = cwd.to_path_buf();
+    cached_git_metadata(cwd, MetadataKind::GitInfo, move || async move {
+        collect_git_info_uncached(&owned_cwd).await
+    })
+    .await
+}
+
+async fn collect_git_info_uncached(cwd: &Path) -> Option<GitInfo> {
     // Check if we're in a git repository first
     let is_git_repo = run_git_command_with_timeout(&["rev-parse", "--git-dir"], cwd)
         .await?
@@ -131,20 +141,41 @@ pub async fn get_git_remote_urls(cwd: &Path) -> Option<BTreeMap<String, Sanitize
 }
 
 /// Collect fetch remotes without checking whether `cwd` is in a git repo.
+///
+/// Results are reused while the repository and global Git config files are
+/// unchanged; see [`crate::metadata_cache`].
 pub async fn get_git_remote_urls_assume_git_repo(
     cwd: &Path,
 ) -> Option<BTreeMap<String, SanitizedGitUrl>> {
-    let output = run_git_command_with_timeout(&["remote", "-v"], cwd).await?;
-    if !output.status.success() {
-        return None;
-    }
+    // The outer `Option` distinguishes a failed Git invocation (not cached)
+    // from a repository without remotes (cached).
+    let owned_cwd = cwd.to_path_buf();
+    cached_git_metadata(cwd, MetadataKind::RemoteUrls, move || async move {
+        let output = run_git_command_with_timeout(&["remote", "-v"], &owned_cwd).await?;
+        if !output.status.success() {
+            return None;
+        }
 
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_git_remote_urls(stdout.as_str())
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        Some(parse_git_remote_urls(stdout.as_str()))
+    })
+    .await
+    .flatten()
 }
 
 /// Return the current HEAD commit hash without checking whether `cwd` is in a git repo.
+///
+/// Results are reused while HEAD, the ref it points at, `packed-refs` and the
+/// Git config files are unchanged; see [`crate::metadata_cache`].
 pub async fn get_head_commit_hash(cwd: &Path) -> Option<GitSha> {
+    let owned_cwd = cwd.to_path_buf();
+    cached_git_metadata(cwd, MetadataKind::HeadCommit, move || async move {
+        get_head_commit_hash_uncached(&owned_cwd).await
+    })
+    .await
+}
+
+async fn get_head_commit_hash_uncached(cwd: &Path) -> Option<GitSha> {
     let output = run_git_command_with_timeout(&["rev-parse", "HEAD"], cwd).await?;
     if !output.status.success() {
         return None;
@@ -767,7 +798,7 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
     Some(diff)
 }
 
-fn find_ancestor_git_entry(base_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn find_ancestor_git_entry(base_dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut dir = base_dir.to_path_buf();
 
     loop {
