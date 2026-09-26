@@ -9,8 +9,8 @@
 // Turns make real model calls on the user's login; --turns 0 measures startup only.
 import { spawn, spawnSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, index, all) => {
@@ -31,6 +31,16 @@ const step = (label, promise) => Promise.race([
   new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout: ${label}`)), stepTimeoutMs)),
 ])
 const turns = Number(args.turns ?? 3)
+const turnsPerRun = Number(args['turns-per-run'] ?? 1)
+// --stale-cache: backdate the model cache before each run (the cache stays valid, it only looks
+// old), reproducing a launch more than 5 minutes after the last refresh.
+const staleCache = args['stale-cache'] !== undefined
+const modelsCache = join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'models_cache.json')
+function backdateModelsCache() {
+  const text = readFileSync(modelsCache, 'utf8')
+  const stale = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
+  writeFileSync(modelsCache, text.replace(/"fetched_at":\s*"[^"]*"/, `"fetched_at": "${stale}"`))
+}
 
 async function measure(codex, withTurn) {
   const cwd = mkdtempSync(join(tmpdir(), 'sig-codex-bench-'))
@@ -57,6 +67,7 @@ async function measure(codex, withTurn) {
   })
   const waitFor = (predicate) => new Promise((resolve) => listeners.push((m) => predicate(m) && resolve(m)))
 
+  if (staleCache) backdateModelsCache()
   const t0 = performance.now()
   const result = {}
   try {
@@ -70,14 +81,20 @@ async function measure(codex, withTurn) {
     const started = await step('thread/start', request('thread/start', { cwd, ephemeral: true }))
     result.threadStart = performance.now() - t
     if (withTurn) {
-      t = performance.now()
-      const firstDelta = waitFor((m) => m.method.endsWith('/delta'))
-      const completed = waitFor((m) => m.method === 'turn/completed')
-      await step('turn/start', request('turn/start', { threadId: started.thread.id, input: [{ type: 'text', text: 'Reply with exactly: OK', text_elements: [] }] }))
-      await step('first delta', firstDelta)
-      result.firstToken = performance.now() - t
-      await step('turn/completed', completed)
-      result.turn = performance.now() - t
+      const followups = []
+      for (let n = 0; n < turnsPerRun; n++) {
+        t = performance.now()
+        const firstDelta = waitFor((m) => m.method.endsWith('/delta'))
+        const completed = waitFor((m) => m.method === 'turn/completed')
+        await step('turn/start', request('turn/start', { threadId: started.thread.id, input: [{ type: 'text', text: 'Reply with exactly: OK', text_elements: [] }] }))
+        await step('first delta', firstDelta)
+        const firstToken = performance.now() - t
+        await step('turn/completed', completed)
+        const turn = performance.now() - t
+        if (n === 0) Object.assign(result, { firstToken, turn })
+        else followups.push(turn)
+      }
+      if (followups.length) result.followupTurn = median(followups)
     }
     result.total = performance.now() - t0
   } catch (error) {
@@ -108,7 +125,7 @@ for (let i = 0; i < runs; i++) {
   }
 }
 
-const metrics = ['initialize', 'modelList', 'threadStart', 'firstToken', 'turn', 'total']
+const metrics = ['initialize', 'modelList', 'threadStart', 'firstToken', 'turn', 'followupTurn', 'total']
 const report = {}
 for (const metric of metrics) {
   const a = samples.a.map((s) => s[metric]).filter((v) => typeof v === 'number')
