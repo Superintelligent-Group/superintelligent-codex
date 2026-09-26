@@ -87,7 +87,9 @@ pub enum RefreshStrategy {
     Online,
     /// Only use cached data, never fetch from the network.
     Offline,
-    /// Use cache if available and fresh, otherwise fetch from the network.
+    /// Use cache if available and fresh. A stale cache for the same client version and identity is
+    /// served immediately while the catalog refreshes in the background (stale-while-revalidate);
+    /// with no usable cache at all, fetch from the network before returning.
     OnlineIfUncached,
 }
 
@@ -258,11 +260,30 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
 /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
+    /// Shared so a stale-while-revalidate refresh can outlive the request that started it.
+    inner: Arc<OpenAiModelsManagerInner>,
+}
+
+#[derive(Debug)]
+struct OpenAiModelsManagerInner {
     remote_models: RwLock<ModelsCacheEntry>,
     cache: Option<Arc<dyn ModelsCache>>,
     endpoint_client: SharedModelsEndpointClient,
     api_key_model_discovery_enabled: AtomicBool,
     auth_manager: Option<Arc<AuthManager>>,
+    /// Set while a background refresh started from a stale cache hit is running.
+    background_refresh_in_flight: AtomicBool,
+}
+
+/// Clears the in-flight flag even if the background refresh panics or is cancelled.
+struct BackgroundRefreshGuard(Arc<OpenAiModelsManagerInner>);
+
+impl Drop for BackgroundRefreshGuard {
+    fn drop(&mut self) {
+        self.0
+            .background_refresh_in_flight
+            .store(false, Ordering::SeqCst);
+    }
 }
 
 /// Static model manager backed by an authoritative in-process catalog.
@@ -317,17 +338,20 @@ impl OpenAiModelsManager {
     ) -> Self {
         let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
-            remote_models: RwLock::new(ModelsCacheEntry {
-                fetched_at: Utc::now(),
-                etag: None,
-                client_version: Some(crate::client_version_to_whole()),
-                identity: endpoint_client.identity(),
-                models: remote_models,
+            inner: Arc::new(OpenAiModelsManagerInner {
+                remote_models: RwLock::new(ModelsCacheEntry {
+                    fetched_at: Utc::now(),
+                    etag: None,
+                    client_version: Some(crate::client_version_to_whole()),
+                    identity: endpoint_client.identity(),
+                    models: remote_models,
+                }),
+                cache,
+                api_key_model_discovery_enabled: AtomicBool::new(false),
+                endpoint_client,
+                auth_manager,
+                background_refresh_in_flight: AtomicBool::new(false),
             }),
-            cache,
-            api_key_model_discovery_enabled: AtomicBool::new(false),
-            endpoint_client,
-            auth_manager,
         }
     }
 }
@@ -344,7 +368,8 @@ impl StaticModelsManager {
 
 impl ModelsManager for OpenAiModelsManager {
     fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
-        self.api_key_model_discovery_enabled
+        self.inner
+            .api_key_model_discovery_enabled
             .store(enabled, Ordering::SeqCst);
     }
 
@@ -367,11 +392,12 @@ impl ModelsManager for OpenAiModelsManager {
         Box::pin(async move {
             let refresh = async {
                 // Resolve lazy command credentials before comparing catalog identities.
-                if !self.should_refresh_models().await {
+                if !self.inner.should_refresh_models().await {
                     return Ok(());
                 }
-                let identity = self.endpoint_client.identity();
-                if identity.is_some() && self.remote_models.read().await.identity == identity {
+                let identity = self.inner.endpoint_client.identity();
+                if identity.is_some() && self.inner.remote_models.read().await.identity == identity
+                {
                     return Ok(());
                 }
                 self.refresh_available_models(
@@ -392,8 +418,8 @@ impl ModelsManager for OpenAiModelsManager {
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
         Box::pin(async move {
-            let entry = self.remote_models.read().await;
-            if entry.identity.is_some() && entry.identity == self.endpoint_client.identity() {
+            let entry = self.inner.remote_models.read().await;
+            if entry.identity.is_some() && entry.identity == self.inner.endpoint_client.identity() {
                 entry.models.clone()
             } else {
                 load_remote_models_from_file().unwrap_or_default()
@@ -402,9 +428,9 @@ impl ModelsManager for OpenAiModelsManager {
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
-        let entry = self.remote_models.try_read()?;
+        let entry = self.inner.remote_models.try_read()?;
         Ok(
-            if entry.identity.is_some() && entry.identity == self.endpoint_client.identity() {
+            if entry.identity.is_some() && entry.identity == self.inner.endpoint_client.identity() {
                 entry.models.clone()
             } else {
                 load_remote_models_from_file().unwrap_or_default()
@@ -413,7 +439,7 @@ impl ModelsManager for OpenAiModelsManager {
     }
 
     fn auth_manager(&self) -> Option<&AuthManager> {
-        self.auth_manager.as_deref()
+        self.inner.auth_manager.as_deref()
     }
 
     fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
@@ -452,14 +478,14 @@ impl OpenAiModelsManager {
 
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
         let (identity, current_etag) = {
-            let entry = self.remote_models.read().await;
+            let entry = self.inner.remote_models.read().await;
             (entry.identity.clone(), entry.etag.clone())
         };
         if let Some(identity) = identity
-            && Some(&identity) == self.endpoint_client.identity().as_ref()
+            && Some(&identity) == self.inner.endpoint_client.identity().as_ref()
             && current_etag.as_deref() == Some(etag.as_str())
         {
-            if let Some(cache) = self.cache.as_ref()
+            if let Some(cache) = self.inner.cache.as_ref()
                 && let Err(err) = cache
                     .refresh_ttl(&crate::client_version_to_whole(), &identity, &etag)
                     .await
@@ -485,37 +511,100 @@ impl OpenAiModelsManager {
         // API-key discovery must be enabled and supported before reusing a remote catalog.
         // Otherwise even a matching cache from an earlier run would bypass bundled-only behavior.
         // Command-auth providers retain their existing discovery behavior.
-        if self.uses_api_key_auth()
-            && !self.endpoint_client.has_command_auth()
-            && (!self.endpoint_client.supports_api_key_models()
-                || !self.api_key_model_discovery_enabled.load(Ordering::SeqCst))
+        if self.inner.uses_api_key_auth()
+            && !self.inner.endpoint_client.has_command_auth()
+            && (!self.inner.endpoint_client.supports_api_key_models()
+                || !self
+                    .inner
+                    .api_key_model_discovery_enabled
+                    .load(Ordering::SeqCst))
         {
             return Ok(());
         }
-        if !self.should_refresh_models().await {
+        if !self.inner.should_refresh_models().await {
             if matches!(
                 refresh_strategy,
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
             ) {
-                self.try_load_cache().await;
+                self.inner.try_load_cache().await;
             }
             return Ok(());
         }
         match refresh_strategy {
             RefreshStrategy::Offline => {
-                self.try_load_cache().await;
+                self.inner.try_load_cache().await;
                 Ok(())
             }
             RefreshStrategy::OnlineIfUncached => {
-                if self.try_load_cache().await {
+                if self.inner.try_load_cache().await {
                     return Ok(());
                 }
-                self.fetch_and_update_models(http_client_factory).await
+                // Stale-while-revalidate: serve any cached catalog for this client version and
+                // identity immediately, and refresh it without blocking the caller.
+                if self.inner.try_load_stale_cache().await
+                    && self.spawn_background_refresh(http_client_factory)
+                {
+                    return Ok(());
+                }
+                // A refresh is only started after a stale catalog was applied in memory, so while
+                // one is in flight the caller already has models; never race it with a second
+                // (blocking) fetch because a concurrent cache read came back unusable.
+                if self
+                    .inner
+                    .background_refresh_in_flight
+                    .load(Ordering::SeqCst)
+                {
+                    return Ok(());
+                }
+                self.inner
+                    .fetch_and_update_models(http_client_factory)
+                    .await
             }
-            RefreshStrategy::Online => self.fetch_and_update_models(http_client_factory).await,
+            RefreshStrategy::Online => {
+                self.inner
+                    .fetch_and_update_models(http_client_factory)
+                    .await
+            }
         }
     }
 
+    /// Start a background refresh unless one is already running.
+    ///
+    /// Returns `false` only when no Tokio runtime is available, in which case the caller must
+    /// refresh inline. Returns `true` when a refresh was started or is already in flight.
+    fn spawn_background_refresh(&self, http_client_factory: &HttpClientFactory) -> bool {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        if self
+            .inner
+            .background_refresh_in_flight
+            .swap(true, Ordering::SeqCst)
+        {
+            return true;
+        }
+        let guard = BackgroundRefreshGuard(Arc::clone(&self.inner));
+        let http_client_factory = http_client_factory.clone();
+        handle.spawn(
+            async move {
+                // A previous refresh may have landed between the caller's freshness check and
+                // claiming the in-flight flag; re-check before spending a network fetch.
+                if guard.0.try_load_cache().await {
+                    drop(guard);
+                    return;
+                }
+                if let Err(err) = guard.0.fetch_and_update_models(&http_client_factory).await {
+                    tracing::warn!("background model catalog refresh failed: {err}");
+                }
+                drop(guard);
+            }
+            .instrument(tracing::info_span!("models_background_refresh")),
+        );
+        true
+    }
+}
+
+impl OpenAiModelsManagerInner {
     async fn fetch_and_update_models(
         &self,
         http_client_factory: &HttpClientFactory,
@@ -605,17 +694,34 @@ impl OpenAiModelsManager {
 
     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
     async fn try_load_cache(&self) -> bool {
+        self.try_load_cache_entry(/*allow_stale*/ false).await
+    }
+
+    /// Apply a cached catalog of any age when it matches the client version and provider.
+    async fn try_load_stale_cache(&self) -> bool {
+        self.try_load_cache_entry(/*allow_stale*/ true).await
+    }
+
+    async fn try_load_cache_entry(&self, allow_stale: bool) -> bool {
         let Some(cache) = self.cache.as_ref() else {
             return false;
         };
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::client_version_to_whole();
-        info!(client_version, "models cache: evaluating cache eligibility");
+        info!(
+            client_version,
+            allow_stale, "models cache: evaluating cache eligibility"
+        );
         let Some(identity) = self.endpoint_client.identity() else {
             return false;
         };
-        let cache_entry = match cache.load(&client_version).await {
+        let loaded = if allow_stale {
+            cache.load_stale(&client_version).await
+        } else {
+            cache.load(&client_version).await
+        };
+        let cache_entry = match loaded {
             Ok(Some(cache_entry)) => cache_entry,
             Ok(None) => {
                 info!("models cache: no usable cache entry");
