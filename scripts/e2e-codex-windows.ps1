@@ -20,7 +20,9 @@ param(
   [string]$Prompt = 'Reply with exactly: SIG-E2E-OK',
   [int]$TimeoutSeconds = 240,
   # Also list every process the detached codex spawned, grouped by parent.
-  [switch]$Diagnose
+  [switch]$Diagnose,
+  # With -Diagnose, print every command line codex itself spawned for this process name (e.g. git.exe).
+  [string]$ShowCommandsFor
 )
 
 Add-Type @'
@@ -94,13 +96,14 @@ while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
       if ($tree.ContainsKey([int]$p.ParentProcessId) -and -not $tree.ContainsKey([int]$p.ProcessId)) {
         $tree[[int]$p.ProcessId] = $true
         $parent = if ($spawned.ContainsKey([int]$p.ParentProcessId)) { $spawned[[int]$p.ParentProcessId].name } else { 'codex' }
-        $spawned[[int]$p.ProcessId] = [pscustomobject]@{ name = $p.Name; parent = $parent; cmd = "$($p.CommandLine)".Substring(0, [Math]::Min(140, "$($p.CommandLine)".Length)) }
+        $spawned[[int]$p.ProcessId] = [pscustomobject]@{ name = $p.Name; parent = $parent; cmd = "$($p.CommandLine)".Substring(0, [Math]::Min(300, "$($p.CommandLine)".Length)) }
       }
     }
   }
   Start-Sleep -Milliseconds 100
 }
 if ($Diagnose) { Write-Host 'visible console windows by title:'; $seen.Values | Group-Object | Sort-Object Count -Descending | ForEach-Object { "{0,3}  {1}" -f $_.Count, $_.Name } | Write-Host; Write-Host 'spawned processes:'; $spawned.Values | Group-Object parent, name | Sort-Object Count -Descending | ForEach-Object { "{0,3}  {1}  e.g. {2}" -f $_.Count, $_.Name, $_.Group[0].cmd } | Write-Host }
+if ($Diagnose -and $ShowCommandsFor) { Write-Host "commands codex spawned ($ShowCommandsFor):"; $spawned.Values | Where-Object { $_.parent -eq 'codex' -and $_.name -eq $ShowCommandsFor } | ForEach-Object { "  $($_.cmd)" } | Write-Host }
 $timedOut = -not $proc.HasExited
 if ($timedOut) { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }
 
