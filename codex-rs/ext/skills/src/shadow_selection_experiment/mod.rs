@@ -14,9 +14,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::HostSkillsSnapshot;
-use codex_extension_api::TurnInputContext;
 use codex_otel::MetricsClient;
 use codex_protocol::user_input::UserInput;
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
 
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
@@ -67,18 +69,72 @@ impl ShadowSelectionExperiment {
         }
     }
 
+    /// Evaluates the shadow selectors off the turn's critical path.
+    ///
+    /// The evaluation only feeds metrics and invocation telemetry; it never
+    /// influences which skills are injected. Runs for one thread are chained
+    /// behind `previous`, so each run still observes the prior run's history
+    /// updates in order, exactly as when it ran inline.
+    pub(crate) fn spawn(
+        self: &Arc<Self>,
+        previous: Option<PendingShadowSelection>,
+        request: ShadowSelectionRequest,
+    ) -> PendingShadowSelection {
+        let experiment = Arc::clone(self);
+        let evaluate = move || {
+            let ShadowSelectionRequest {
+                turn_id,
+                user_input,
+                catalog,
+                explicitly_selected,
+                host_snapshot,
+                recent_skill_invocations,
+                task_context,
+            } = request;
+            Arc::new(experiment.run(
+                &turn_id,
+                &user_input,
+                &catalog,
+                &explicitly_selected,
+                host_snapshot.as_deref(),
+                recent_skill_invocations,
+                task_context,
+            ))
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime to offload onto: evaluate lazily when first awaited.
+            return async move {
+                if let Some(previous) = previous {
+                    let _ = previous.await;
+                }
+                Some(evaluate())
+            }
+            .boxed()
+            .shared();
+        };
+        let blocking = handle.clone();
+        let task = handle.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            blocking.spawn_blocking(evaluate).await.ok()
+        });
+        async move { task.await.ok().flatten() }.boxed().shared()
+    }
+
     pub(crate) fn run(
         &self,
-        input: &TurnInputContext<'_>,
+        turn_id: &str,
+        user_input: &[UserInput],
         catalog: &SkillCatalog,
         explicitly_selected: &[SkillCatalogEntry],
         host_snapshot: Option<&HostSkillsSnapshot>,
         recent_skill_invocations: Arc<RecentSkillInvocations>,
         task_context: Arc<ShadowTaskContext>,
     ) -> ShadowSelectionTurnState {
-        let query = build_shadow_query(&input.user_input);
+        let query = build_shadow_query(user_input);
         let query_script = query_script_tag(&query.text);
-        let task_snapshot = task_context.begin_turn(&input.turn_id, &query, &input.user_input);
+        let task_snapshot = task_context.begin_turn(turn_id, &query, user_input);
         let explicitly_selected_skill_resources = explicitly_selected
             .iter()
             .map(|entry| normalize_skill_resource(entry.main_prompt.as_str()))
@@ -213,14 +269,14 @@ impl ShadowSelectionExperiment {
                 )
         }) {
             task_context.record(
-                &input.turn_id,
+                turn_id,
                 normalize_skill_resource(entry.main_prompt.as_str()),
             );
         }
 
         ShadowSelectionTurnState {
             ranked_selections,
-            turn_id: input.turn_id.clone(),
+            turn_id: turn_id.to_string(),
             query_script,
             eligible_skill_resources,
             seen_skill_resources: Mutex::new(HashSet::new()),
@@ -314,6 +370,21 @@ impl ShadowSelectionExperiment {
             &tags,
         );
     }
+}
+
+/// A shadow evaluation that may still be running in the background.
+pub(crate) type PendingShadowSelection =
+    Shared<BoxFuture<'static, Option<Arc<ShadowSelectionTurnState>>>>;
+
+/// Owned inputs for one background shadow evaluation.
+pub(crate) struct ShadowSelectionRequest {
+    pub(crate) turn_id: String,
+    pub(crate) user_input: Vec<UserInput>,
+    pub(crate) catalog: SkillCatalog,
+    pub(crate) explicitly_selected: Vec<SkillCatalogEntry>,
+    pub(crate) host_snapshot: Option<Arc<HostSkillsSnapshot>>,
+    pub(crate) recent_skill_invocations: Arc<RecentSkillInvocations>,
+    pub(crate) task_context: Arc<ShadowTaskContext>,
 }
 
 pub(crate) struct ShadowSelectionTurnState {

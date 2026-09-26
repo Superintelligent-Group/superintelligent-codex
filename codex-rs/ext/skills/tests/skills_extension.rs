@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use assert_matches::assert_matches;
 use codex_config::ConfigLayerEntry;
@@ -880,19 +881,37 @@ async fn shadow_selection_uses_host_catalog_when_instructions_are_disabled() -> 
             .is_none()
     );
     assert!(fragments.is_empty());
-    let snapshot = metrics.snapshot()?;
-    let catalog_entry_counts = snapshot
-        .scope_metrics()
-        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        .find(|metric| metric.name() == "codex.skills.shadow_selection.catalog_entries")
-        .map(|metric| match metric.data() {
-            AggregatedMetrics::F64(MetricData::Histogram(histogram)) => histogram
-                .data_points()
-                .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::sum)
-                .collect::<Vec<_>>(),
-            data => panic!("unexpected shadow catalog metric data: {data:?}"),
-        })
-        .ok_or("shadow catalog metric should be recorded")?;
+    // Shadow selection is telemetry-only and runs off the turn's critical
+    // path, so its metrics land shortly after `contribute` returns.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let catalog_entry_counts = loop {
+        let snapshot = metrics.snapshot()?;
+        let counts = snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == "codex.skills.shadow_selection.catalog_entries")
+            .map(|metric| match metric.data() {
+                AggregatedMetrics::F64(MetricData::Histogram(histogram)) => histogram
+                    .data_points()
+                    .map(|point| (point.count(), point.sum()))
+                    .collect::<Vec<_>>(),
+                data => panic!("unexpected shadow catalog metric data: {data:?}"),
+            });
+        let total_runs = counts
+            .iter()
+            .flatten()
+            .map(|(count, _)| *count)
+            .sum::<u64>();
+        // One observation per shadow method (6 lexical + 5 routing/LRU + task fusion).
+        if total_runs >= 12 || tokio::time::Instant::now() >= deadline {
+            break counts
+                .ok_or("shadow catalog metric should be recorded")?
+                .into_iter()
+                .map(|(_, sum)| sum)
+                .collect::<Vec<_>>();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
 
     assert!(
         catalog_entry_counts.iter().all(|count| *count == 1.0),
