@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
 use crate::CodexResponsesHeaders;
@@ -211,7 +212,10 @@ struct ModelClientState {
     concurrent_reasoning_summaries_enabled: bool,
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
+    /// Set when the server rejects the websocket upgrade outright (426); sticky for the session.
     disable_websockets: AtomicBool,
+    /// Cooldown after a turn exhausted its websocket retries and fell back to HTTP.
+    websocket_fallback_cooldown: StdMutex<WebsocketFallbackCooldown>,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
 }
@@ -251,8 +255,9 @@ impl RequestRouteTelemetry {
 /// This holds configuration and state that should be shared across turns within a Codex session
 /// (auth, provider selection, thread id, and transport fallback state).
 ///
-/// WebSocket fallback is session-scoped: once a turn activates the HTTP fallback, subsequent turns
-/// will also use HTTP for the remainder of the session.
+/// WebSocket fallback is turn-scoped: once a turn exhausts its websocket retries it finishes on
+/// HTTP, and later turns retry websockets after a cooldown (see [`WebsocketFallbackCooldown`]).
+/// Only a 426 Upgrade Required from the server disables websockets for the whole session.
 ///
 /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
 /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
@@ -296,6 +301,76 @@ pub struct ModelClientSession {
     /// appends, or continuation requests), and must not send it between different turns.
     /// An auth ownership change clears it so the new owner gets fresh routing state.
     turn_state: Arc<OnceLock<String>>,
+    /// Set once this turn fell back to HTTP; the rest of the turn stays on HTTP.
+    http_fallback_active: bool,
+    /// Failure classifications observed on this turn's websocket response streams.
+    websocket_stream_signals: Arc<WebsocketStreamSignals>,
+}
+
+/// Initial HTTP-only window after a turn falls back from websockets.
+const WEBSOCKET_FALLBACK_INITIAL_COOLDOWN: Duration = Duration::from_secs(120);
+/// Upper bound for the doubling fallback cooldown.
+const WEBSOCKET_FALLBACK_MAX_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+/// Server closes tolerated in one turn before falling back: the first close gets one blind
+/// websocket retry, the second switches the turn to HTTP.
+const MAX_WEBSOCKET_SERVER_CLOSES_BEFORE_FALLBACK: u32 = 2;
+
+/// Session-wide backoff for re-attempting websockets after a turn fell back to HTTP.
+///
+/// Each fallback keeps websockets off for the current cooldown and doubles the next one (capped),
+/// so a persistently broken websocket path costs one failed attempt per window instead of one per
+/// turn. A websocket response that completes resets the cooldown.
+#[derive(Debug)]
+struct WebsocketFallbackCooldown {
+    disabled_until: Option<tokio::time::Instant>,
+    next_cooldown: Duration,
+}
+
+impl Default for WebsocketFallbackCooldown {
+    fn default() -> Self {
+        Self {
+            disabled_until: None,
+            next_cooldown: WEBSOCKET_FALLBACK_INITIAL_COOLDOWN,
+        }
+    }
+}
+
+impl WebsocketFallbackCooldown {
+    fn is_active(&self, now: tokio::time::Instant) -> bool {
+        self.disabled_until.is_some_and(|until| now < until)
+    }
+
+    fn start(&mut self, now: tokio::time::Instant) {
+        self.disabled_until = Some(now + self.next_cooldown);
+        self.next_cooldown = self
+            .next_cooldown
+            .saturating_mul(2)
+            .min(WEBSOCKET_FALLBACK_MAX_COOLDOWN);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// How far an HTTP fallback reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HttpFallbackScope {
+    /// The server does not support websockets (426); stay on HTTP for the session.
+    Session,
+    /// Websocket retries were exhausted; finish this turn on HTTP and retry after a cooldown.
+    Turn,
+}
+
+/// Websocket stream failures that change the next attempt's strategy, recorded as errors flow
+/// through the turn's response streams.
+#[derive(Debug, Default)]
+struct WebsocketStreamSignals {
+    /// A stream failed with a recoverable auth error (an auth close or a wrapped 401), so the
+    /// next websocket attempt must run unauthorized recovery before reconnecting.
+    pending_auth_recovery: AtomicBool,
+    /// Server-initiated closes seen since the last completed websocket response.
+    server_closes: AtomicU32,
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +608,7 @@ impl ModelClient {
                 include_attestation,
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
+                websocket_fallback_cooldown: StdMutex::new(WebsocketFallbackCooldown::default()),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
@@ -608,6 +684,8 @@ impl ModelClient {
             client: self.clone(),
             websocket_session,
             turn_state: Arc::new(OnceLock::new()),
+            http_fallback_active: false,
+            websocket_stream_signals: Arc::new(WebsocketStreamSignals::default()),
         }
     }
 
@@ -641,16 +719,29 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
     }
 
-    pub(crate) fn force_http_fallback(
+    /// Records an HTTP fallback in session state. Returns whether websockets were enabled at the
+    /// session level before this call.
+    fn force_http_fallback(
         &self,
         session_telemetry: &SessionTelemetry,
-        _model_info: &ModelInfo,
+        scope: HttpFallbackScope,
     ) -> bool {
         let websocket_enabled = self.responses_websocket_enabled();
-        let activated =
-            websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
-        if activated {
-            warn!("falling back to HTTP");
+        match scope {
+            HttpFallbackScope::Session => {
+                self.state.disable_websockets.store(true, Ordering::Relaxed);
+            }
+            HttpFallbackScope::Turn if websocket_enabled => {
+                self.state
+                    .websocket_fallback_cooldown
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .start(tokio::time::Instant::now());
+            }
+            HttpFallbackScope::Turn => {}
+        }
+        if websocket_enabled {
+            warn!(?scope, "falling back to HTTP");
             session_telemetry.counter(
                 "codex.transport.fallback_to_http",
                 /*inc*/ 1,
@@ -659,7 +750,16 @@ impl ModelClient {
         }
 
         self.store_cached_websocket_session(WebsocketSession::default());
-        activated
+        websocket_enabled
+    }
+
+    /// Clears the fallback cooldown after a websocket response completed.
+    fn note_websocket_response_completed(&self) {
+        self.state
+            .websocket_fallback_cooldown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reset();
     }
 
     pub(crate) async fn create_realtime_call_with_headers(
@@ -1016,7 +1116,8 @@ impl ModelClient {
 
     /// Returns whether the Responses-over-WebSocket transport is active for this session.
     ///
-    /// WebSocket use is controlled by provider capability and session-scoped fallback state.
+    /// WebSocket use is controlled by provider capability, the session-scoped 426 fallback, and the
+    /// cooldown that follows a turn-scoped fallback.
     pub fn responses_websocket_enabled(&self) -> bool {
         if !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
@@ -1024,7 +1125,12 @@ impl ModelClient {
             return false;
         }
 
-        true
+        !self
+            .state
+            .websocket_fallback_cooldown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_active(tokio::time::Instant::now())
     }
 
     /// Returns auth + provider configuration resolved from the current session auth state.
@@ -1451,7 +1557,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) -> std::result::Result<(), ApiError> {
-        if !self.client.responses_websocket_enabled() {
+        if !self.responses_websocket_enabled() {
             return Ok(());
         }
         let client_setup = self
@@ -1803,6 +1909,35 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        if self
+            .websocket_stream_signals
+            .pending_auth_recovery
+            .swap(false, Ordering::AcqRel)
+        {
+            // The previous stream on this turn was rejected for credentials after a successful
+            // handshake (an auth close or wrapped 401). Refresh before reconnecting so the retry
+            // does not replay the same rejected token.
+            self.websocket_session.reset(Some("other"));
+            pending_retry = PendingUnauthorizedRetry::from_recovery(
+                handle_unauthorized(
+                    TransportError::Http {
+                        status: StatusCode::UNAUTHORIZED,
+                        url: None,
+                        headers: None,
+                        body: Some(
+                            "responses websocket stream was rejected as unauthorized".to_string(),
+                        ),
+                    },
+                    &mut auth_recovery,
+                    &mut provider_auth_recovery_attempted,
+                    session_telemetry,
+                    &provider,
+                    self.client.event_sender.as_ref(),
+                    responses_metadata.turn_id.as_deref(),
+                )
+                .await?,
+            );
+        }
         loop {
             let client_setup = self
                 .client
@@ -2021,11 +2156,12 @@ impl ModelClientSession {
                 );
                 err
             })?;
-            let (stream, last_request_rx) = map_response_stream(
+            let (stream, last_request_rx) = map_websocket_response_stream(
                 stream_result,
                 request_session_telemetry,
                 inference_trace_attempt,
-                Arc::clone(&self.client.state.provider),
+                self.client.clone(),
+                Arc::clone(&self.websocket_stream_signals),
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -2078,7 +2214,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        if !self.client.responses_websocket_enabled() {
+        if !self.responses_websocket_enabled() {
             return Ok(());
         }
         if self.websocket_session.last_request.is_some() {
@@ -2113,7 +2249,11 @@ impl ModelClientSession {
                 Ok(())
             }
             Ok(WebsocketStreamOutcome::FallbackToHttp) => {
-                self.try_switch_fallback_transport(session_telemetry, model_info);
+                self.try_switch_fallback_transport(
+                    session_telemetry,
+                    model_info,
+                    HttpFallbackScope::Session,
+                );
                 Ok(())
             }
             Err(err) => Err(err),
@@ -2143,7 +2283,7 @@ impl ModelClientSession {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
-                if self.client.responses_websocket_enabled() {
+                if self.responses_websocket_enabled() {
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -2162,7 +2302,11 @@ impl ModelClientSession {
                     {
                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
                         WebsocketStreamOutcome::FallbackToHttp => {
-                            self.try_switch_fallback_transport(session_telemetry, model_info);
+                            self.try_switch_fallback_transport(
+                                session_telemetry,
+                                model_info,
+                                HttpFallbackScope::Session,
+                            );
                         }
                     }
                 }
@@ -2182,22 +2326,42 @@ impl ModelClientSession {
         }
     }
 
-    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+    /// Switches this turn to HTTP and resets WebSocket state.
     ///
-    /// This is used after exhausting the provider retry budget, to force subsequent requests onto
-    /// the HTTP transport.
+    /// [`HttpFallbackScope::Turn`] is used after exhausting the websocket retry budget: the rest
+    /// of this turn uses HTTP and later turns retry websockets once the cooldown expires.
+    /// [`HttpFallbackScope::Session`] is used when the server refuses the upgrade (426).
     ///
-    /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
+    /// Returns `true` if this call activated fallback, or `false` if this turn was already on HTTP.
     pub(crate) fn try_switch_fallback_transport(
         &mut self,
         session_telemetry: &SessionTelemetry,
-        model_info: &ModelInfo,
+        _model_info: &ModelInfo,
+        scope: HttpFallbackScope,
     ) -> bool {
-        let activated = self
-            .client
-            .force_http_fallback(session_telemetry, model_info);
+        let was_websocket = self.responses_websocket_enabled();
+        if was_websocket || scope == HttpFallbackScope::Session {
+            self.client.force_http_fallback(session_telemetry, scope);
+        }
+        self.http_fallback_active = true;
         self.websocket_session = WebsocketSession::default();
-        activated
+        was_websocket
+    }
+
+    /// Returns whether this turn should still use the Responses WebSocket transport.
+    pub(crate) fn responses_websocket_enabled(&self) -> bool {
+        !self.http_fallback_active && self.client.responses_websocket_enabled()
+    }
+
+    /// Returns `true` once this turn has seen enough server-initiated websocket closes that it
+    /// should stop retrying over websockets and fall back to HTTP.
+    pub(crate) fn websocket_server_close_budget_exhausted(&self) -> bool {
+        self.responses_websocket_enabled()
+            && self
+                .websocket_stream_signals
+                .server_closes
+                .load(Ordering::Acquire)
+                >= MAX_WEBSOCKET_SERVER_CLOSES_BEFORE_FALLBACK
     }
 }
 
@@ -2275,6 +2439,59 @@ fn map_response_stream(
         inference_trace_attempt,
         provider,
     )
+}
+
+/// Maps a websocket response stream while recording failures that change how the turn retries:
+/// recoverable auth errors (so the next attempt refreshes credentials first) and server closes (so
+/// repeated closes fall back to HTTP instead of reconnecting blindly).
+fn map_websocket_response_stream(
+    api_stream: codex_api::ResponseStream,
+    session_telemetry: SessionTelemetry,
+    inference_trace_attempt: InferenceTraceAttempt,
+    client: ModelClient,
+    signals: Arc<WebsocketStreamSignals>,
+) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
+    let codex_api::ResponseStream {
+        rx_event,
+        upstream_request_id,
+    } = api_stream;
+    let provider = Arc::clone(&client.state.provider);
+    let observer_provider = Arc::clone(&provider);
+    let api_stream = codex_api::ResponseStream {
+        rx_event,
+        upstream_request_id: None,
+    }
+    .inspect(move |event| {
+        observe_websocket_stream_event(event, &signals, &client, &observer_provider)
+    });
+    map_response_events(
+        upstream_request_id,
+        api_stream,
+        session_telemetry,
+        inference_trace_attempt,
+        provider,
+    )
+}
+
+fn observe_websocket_stream_event(
+    event: &std::result::Result<ResponseEvent, ApiError>,
+    signals: &WebsocketStreamSignals,
+    client: &ModelClient,
+    provider: &SharedModelProvider,
+) {
+    match event {
+        Ok(ResponseEvent::Completed { .. }) => {
+            signals.server_closes.store(0, Ordering::Release);
+            client.note_websocket_response_completed();
+        }
+        Err(ApiError::Transport(transport)) if provider.is_recoverable_auth_error(transport) => {
+            signals.pending_auth_recovery.store(true, Ordering::Release);
+        }
+        Err(err) if codex_api::is_websocket_server_close(err) => {
+            signals.server_closes.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(_) | Err(_) => {}
+    }
 }
 
 fn map_response_events<S>(

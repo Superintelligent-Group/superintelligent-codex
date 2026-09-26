@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::client::HttpFallbackScope;
 use crate::client::ModelClientSession;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -65,6 +66,26 @@ pub(crate) async fn handle_response_stream_error(
         return Err(err);
     };
 
+    // A server that accepts the upgrade and then closes mid-response is unlikely to behave
+    // differently on the next blind reconnect: allow one websocket retry, then finish on HTTP.
+    if client_session.websocket_server_close_budget_exhausted()
+        && client_session.try_switch_fallback_transport(
+            &turn_context.session_telemetry,
+            turn_context.model_info(),
+            HttpFallbackScope::Turn,
+        )
+    {
+        sess.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent {
+                message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
+            }),
+        )
+        .await;
+        retry_state.retries = 0;
+        return Ok(());
+    }
+
     if turn_context
         .config
         .features
@@ -97,6 +118,7 @@ pub(crate) async fn handle_response_stream_error(
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,
             turn_context.model_info(),
+            HttpFallbackScope::Turn,
         )
     {
         sess.send_event(
@@ -118,7 +140,7 @@ pub(crate) async fn handle_response_stream_error(
         // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
         let report_error = retry_count > 1
             || cfg!(debug_assertions)
-            || !sess.services.model_client.responses_websocket_enabled();
+            || !client_session.responses_websocket_enabled();
         if report_error {
             // Surface retry information to any UI/front-end so the user understands what is
             // happening instead of staring at a seemingly frozen screen.
