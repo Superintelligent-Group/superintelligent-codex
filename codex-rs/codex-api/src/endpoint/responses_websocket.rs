@@ -551,6 +551,75 @@ fn websocket_config() -> WebSocketConfig {
     config
 }
 
+/// Prefix of the stream error produced when the server closes the websocket before the
+/// response completed. Kept stable because callers classify server closes by it.
+pub const WEBSOCKET_SERVER_CLOSE_MESSAGE: &str =
+    "websocket closed by server before response.completed";
+
+/// Private-use close code (4000 + HTTP 401) conventionally used for credential failures.
+const WEBSOCKET_CLOSE_UNAUTHORIZED: u16 = 4401;
+
+/// Reason fragments that identify a close caused by credentials rather than transport health.
+const AUTH_CLOSE_REASON_MARKERS: &[&str] = &[
+    "unauthorized",
+    "unauthenticated",
+    "authentication",
+    "invalid_token",
+    "invalid token",
+    "token_expired",
+    "token expired",
+    "expired token",
+    "invalid_api_key",
+    "invalid api key",
+];
+
+/// Returns whether `error` is a server-initiated websocket close that happened mid-response and
+/// was not classified as an authentication failure.
+pub fn is_websocket_server_close(error: &ApiError) -> bool {
+    matches!(error, ApiError::Stream(message) if message.starts_with(WEBSOCKET_SERVER_CLOSE_MESSAGE))
+}
+
+/// Classifies a close as a credential failure.
+///
+/// Code 4401 is always auth. Any other code (1008 policy, 4403, 1011, ...) counts only when the
+/// reason names a credential failure: a bare policy/forbidden close is not something a token
+/// refresh can fix, so it keeps the ordinary close handling.
+fn close_frame_is_auth_failure(frame: &CloseFrame) -> bool {
+    if u16::from(frame.code) == WEBSOCKET_CLOSE_UNAUTHORIZED {
+        return true;
+    }
+    let reason = frame.reason.to_ascii_lowercase();
+    AUTH_CLOSE_REASON_MARKERS
+        .iter()
+        .any(|marker| reason.contains(marker))
+}
+
+/// Maps a server close frame received before `response.completed` into an [`ApiError`].
+///
+/// Credential failures become an HTTP 401 transport error so callers run their existing
+/// unauthorized recovery (token refresh) instead of blindly reconnecting with the same token.
+/// Every other close keeps its code and reason in the stream error message.
+fn map_server_close_frame(frame: Option<CloseFrame>) -> ApiError {
+    let Some(frame) = frame else {
+        return ApiError::Stream(format!("{WEBSOCKET_SERVER_CLOSE_MESSAGE} (no close frame)"));
+    };
+    let code = u16::from(frame.code);
+    let reason = frame.reason.to_string();
+    if close_frame_is_auth_failure(&frame) {
+        return ApiError::Transport(TransportError::Http {
+            status: StatusCode::UNAUTHORIZED,
+            url: None,
+            headers: None,
+            body: Some(format!(
+                "websocket closed by server with code {code}: {reason}"
+            )),
+        });
+    }
+    ApiError::Stream(format!(
+        "{WEBSOCKET_SERVER_CLOSE_MESSAGE} (code {code}, reason: {reason:?})"
+    ))
+}
+
 fn map_ws_stream_error(error: WsError) -> ApiError {
     match codex_websocket_client::network_policy_denial(&error) {
         Some(denied) => ApiError::Transport(TransportError::Policy(denied)),
@@ -827,10 +896,8 @@ async fn run_websocket_response_stream(
             Message::Binary(_) => {
                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
             }
-            Message::Close(_) => {
-                return Err(ApiError::Stream(
-                    "websocket closed by server before response.completed".into(),
-                ));
+            Message::Close(frame) => {
+                return Err(map_server_close_frame(frame));
             }
             Message::Frame(_) => {}
             Message::Ping(_) | Message::Pong(_) => {}
@@ -1049,6 +1116,73 @@ mod tests {
         let body = body.expect("expected body");
         assert!(body.contains("usage_limit_reached"));
         assert!(body.contains("The usage limit has been reached"));
+    }
+
+    fn close_frame(code: u16, reason: &str) -> Option<CloseFrame> {
+        Some(CloseFrame {
+            code: code.into(),
+            reason: reason.to_string().into(),
+        })
+    }
+
+    #[test]
+    fn server_close_preserves_code_and_reason() {
+        let error = map_server_close_frame(close_frame(1011, "internal error"));
+
+        assert!(is_websocket_server_close(&error));
+        let ApiError::Stream(message) = error else {
+            panic!("expected ApiError::Stream");
+        };
+        assert_eq!(
+            message,
+            "websocket closed by server before response.completed (code 1011, reason: \"internal error\")"
+        );
+    }
+
+    #[test]
+    fn server_close_without_frame_is_a_server_close() {
+        let error = map_server_close_frame(/*frame*/ None);
+
+        assert!(is_websocket_server_close(&error));
+    }
+
+    #[test]
+    fn auth_server_close_maps_to_unauthorized_transport_error() {
+        for frame in [
+            close_frame(4401, ""),
+            close_frame(1008, "Unauthorized: token expired"),
+            close_frame(4403, "invalid_token"),
+            close_frame(1000, "authentication required"),
+        ] {
+            let error = map_server_close_frame(frame.clone());
+
+            assert!(!is_websocket_server_close(&error), "{frame:?}");
+            let ApiError::Transport(TransportError::Http { status, body, .. }) = error else {
+                panic!("expected ApiError::Transport(Http) for {frame:?}");
+            };
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let frame = frame.expect("frame");
+            assert_eq!(
+                body,
+                Some(format!(
+                    "websocket closed by server with code {}: {}",
+                    u16::from(frame.code),
+                    frame.reason
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn policy_close_without_auth_reason_is_not_auth() {
+        for frame in [
+            close_frame(1008, "message too big"),
+            close_frame(4403, ""),
+            close_frame(1000, "author field missing"),
+        ] {
+            let error = map_server_close_frame(frame.clone());
+            assert!(is_websocket_server_close(&error), "{frame:?}");
+        }
     }
 
     #[test]

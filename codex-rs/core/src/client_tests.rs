@@ -1886,3 +1886,265 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
 }
+
+fn websocket_test_client(provider: SharedModelProvider) -> ModelClient {
+    let mut client = test_model_client(SessionSource::Cli);
+    Arc::get_mut(&mut client.state)
+        .expect("test client should have unique session state")
+        .provider = provider;
+    client
+}
+
+fn websocket_provider_info(base_url: &str) -> ModelProviderInfo {
+    let mut info = create_oss_provider_with_base_url(base_url, WireApi::Responses);
+    info.supports_websockets = true;
+    info.stream_max_retries = Some(0);
+    info.request_max_retries = Some(0);
+    info
+}
+
+#[test]
+fn websocket_fallback_cooldown_doubles_until_capped_and_resets() {
+    let now = tokio::time::Instant::now();
+    let mut cooldown = super::WebsocketFallbackCooldown::default();
+    assert!(!cooldown.is_active(now));
+
+    let mut expected = super::WEBSOCKET_FALLBACK_INITIAL_COOLDOWN;
+    for _ in 0..8 {
+        cooldown.start(now);
+        assert!(cooldown.is_active(now + expected - Duration::from_millis(1)));
+        assert!(!cooldown.is_active(now + expected));
+        expected = (expected * 2).min(super::WEBSOCKET_FALLBACK_MAX_COOLDOWN);
+    }
+    assert_eq!(
+        cooldown.next_cooldown,
+        super::WEBSOCKET_FALLBACK_MAX_COOLDOWN
+    );
+
+    cooldown.reset();
+    assert!(!cooldown.is_active(now));
+    assert_eq!(
+        cooldown.next_cooldown,
+        super::WEBSOCKET_FALLBACK_INITIAL_COOLDOWN
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn turn_http_fallback_is_turn_scoped_and_retries_websockets_after_cooldown() {
+    let client = websocket_test_client(create_model_provider(
+        websocket_provider_info("https://example.com/v1"),
+        /*auth_manager*/ None,
+    ));
+    let telemetry = test_session_telemetry();
+    let model_info = test_model_info();
+
+    let mut turn = client.new_session();
+    assert!(turn.responses_websocket_enabled());
+    assert!(turn.try_switch_fallback_transport(
+        &telemetry,
+        &model_info,
+        super::HttpFallbackScope::Turn,
+    ));
+    // The rest of this turn stays on HTTP; a second switch is a no-op.
+    assert!(!turn.responses_websocket_enabled());
+    assert!(!turn.try_switch_fallback_transport(
+        &telemetry,
+        &model_info,
+        super::HttpFallbackScope::Turn,
+    ));
+    // Later turns wait out the cooldown instead of hammering a failing websocket path.
+    assert!(!client.responses_websocket_enabled());
+    assert!(!client.new_session().responses_websocket_enabled());
+
+    tokio::time::advance(super::WEBSOCKET_FALLBACK_INITIAL_COOLDOWN).await;
+    assert!(client.responses_websocket_enabled());
+    assert!(client.new_session().responses_websocket_enabled());
+    assert!(!turn.responses_websocket_enabled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn upgrade_required_http_fallback_stays_sticky_for_the_session() {
+    let client = websocket_test_client(create_model_provider(
+        websocket_provider_info("https://example.com/v1"),
+        /*auth_manager*/ None,
+    ));
+    let mut turn = client.new_session();
+    assert!(turn.try_switch_fallback_transport(
+        &test_session_telemetry(),
+        &test_model_info(),
+        super::HttpFallbackScope::Session,
+    ));
+
+    tokio::time::advance(super::WEBSOCKET_FALLBACK_MAX_COOLDOWN * 2).await;
+    assert!(!client.responses_websocket_enabled());
+    assert!(!client.new_session().responses_websocket_enabled());
+}
+
+#[test]
+fn websocket_stream_observer_tracks_server_closes_auth_failures_and_completion() {
+    let client = websocket_test_client(create_model_provider(
+        websocket_provider_info("https://example.com/v1"),
+        /*auth_manager*/ None,
+    ));
+    let provider = Arc::clone(&client.state.provider);
+    let session = client.new_session();
+    let signals = Arc::clone(&session.websocket_stream_signals);
+    let observe = |event: std::result::Result<ResponseEvent, ApiError>| {
+        super::observe_websocket_stream_event(&event, &signals, &client, &provider);
+    };
+    let server_close = || {
+        Err(ApiError::Stream(format!(
+            "{} (code 1011, reason: \"\")",
+            codex_api::WEBSOCKET_SERVER_CLOSE_MESSAGE
+        )))
+    };
+    let http_error = |status| {
+        Err(ApiError::Transport(TransportError::Http {
+            status,
+            url: None,
+            headers: None,
+            body: None,
+        }))
+    };
+
+    // One server close earns a single blind websocket retry; the second exhausts the budget.
+    observe(server_close());
+    assert!(!session.websocket_server_close_budget_exhausted());
+    observe(Err(ApiError::Stream("idle timeout".to_string())));
+    assert!(!session.websocket_server_close_budget_exhausted());
+    observe(server_close());
+    assert!(session.websocket_server_close_budget_exhausted());
+
+    // A completed response clears the close budget and the session fallback cooldown.
+    client
+        .state
+        .websocket_fallback_cooldown
+        .lock()
+        .unwrap()
+        .start(tokio::time::Instant::now());
+    assert!(!client.responses_websocket_enabled());
+    observe(Ok(ResponseEvent::Completed {
+        response_id: "resp-1".to_string(),
+        token_usage: None,
+        usage_metadata: None,
+        end_turn: None,
+    }));
+    assert!(!session.websocket_server_close_budget_exhausted());
+    assert!(client.responses_websocket_enabled());
+
+    // Only recoverable auth failures request credential recovery before the next attempt.
+    observe(http_error(http::StatusCode::INTERNAL_SERVER_ERROR));
+    assert!(!signals.pending_auth_recovery.load(Ordering::Acquire));
+    observe(http_error(http::StatusCode::UNAUTHORIZED));
+    assert!(signals.pending_auth_recovery.load(Ordering::Acquire));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_auth_rejection_after_handshake_recovers_credentials_before_reconnect()
+-> anyhow::Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+
+    let server = core_test_support::responses::start_websocket_server(vec![
+        vec![vec![json!({
+            "type": "error",
+            "status": 401,
+            "error": {"type": "invalid_request_error", "message": "token expired"}
+        })]],
+        vec![vec![
+            core_test_support::responses::ev_response_created("resp-1"),
+            core_test_support::responses::ev_completed("resp-1"),
+        ]],
+    ])
+    .await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let client = websocket_test_client(Arc::new(TestRecoveryProvider {
+        inner: create_model_provider(
+            websocket_provider_info(&format!("{}/v1", server.uri())),
+            /*auth_manager*/ None,
+        ),
+        should_fail: false,
+        attempts: Arc::clone(&attempts),
+    }));
+    let prompt = Prompt {
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        ..Default::default()
+    };
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let model_info = test_model_info();
+    let telemetry = test_session_telemetry();
+    let mut session = client.new_session();
+
+    let mut stream = session
+        .stream(
+            &prompt,
+            &model_info,
+            &telemetry,
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &responses_metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await?;
+    let mut first_error = None;
+    while let Some(event) = stream.next().await {
+        if let Err(err) = event {
+            first_error = Some(err);
+            break;
+        }
+    }
+    let first_error = first_error.expect("the rejected stream should fail");
+    match first_error.details() {
+        CodexErrorDetails::UnexpectedStatus(response) => {
+            assert_eq!(response.status, http::StatusCode::UNAUTHORIZED);
+        }
+        other => panic!("unexpected websocket auth failure: {other}"),
+    }
+    drop(stream);
+    assert_eq!(attempts.load(Ordering::Relaxed), 0);
+
+    // The retry refreshes credentials first, then reconnects and completes over websockets.
+    let mut stream = session
+        .stream(
+            &prompt,
+            &model_info,
+            &telemetry,
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &responses_metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await?;
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        if let ResponseEvent::Completed { response_id, .. } = event? {
+            assert_eq!(response_id, "resp-1");
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed);
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(server.connections().len(), 2);
+    assert!(session.responses_websocket_enabled());
+
+    drop(stream);
+    drop(session);
+    server.shutdown().await;
+    Ok(())
+}

@@ -31,4 +31,6 @@ pub use responses_websocket::ResponsesWebsocketClient;
 pub use responses_websocket::ResponsesWebsocketClose;
 pub use responses_websocket::ResponsesWebsocketConnection;
 pub use responses_websocket::ResponsesWebsocketProbe;
+pub use responses_websocket::WEBSOCKET_SERVER_CLOSE_MESSAGE;
+pub use responses_websocket::is_websocket_server_close;
 pub use search::SearchClient;
