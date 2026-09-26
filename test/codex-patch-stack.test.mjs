@@ -20,3 +20,18 @@ test('every patch declares its kind, reason, and exit condition', () => {
     else assert.equal(patch.upstream, null, patch.subject)
   }
 })
+
+test('patch stack matches the fork branch, in order', async (t) => {
+  const { execFileSync } = await import('node:child_process')
+  const { existsSync } = await import('node:fs')
+  const fork = process.env.SIG_CODEX_FORK ?? 'C:/Github/superintelligent-codex'
+  if (!existsSync(fork)) return t.skip(`fork checkout not found at ${fork}`)
+  let subjects
+  try {
+    subjects = execFileSync('git', ['-C', fork, 'log', '--reverse', '--format=%s', `${stack.base.tag}..${stack.branch}`], { encoding: 'utf8' })
+      .split('\n').filter(Boolean)
+  } catch {
+    return t.skip(`${stack.branch} or ${stack.base.tag} not available in ${fork}`)
+  }
+  assert.deepEqual(subjects, stack.patches.map((patch) => patch.subject))
+})

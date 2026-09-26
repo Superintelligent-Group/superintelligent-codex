@@ -18,7 +18,9 @@
 param(
   [string]$Codex = 'codex',
   [string]$Prompt = 'Reply with exactly: SIG-E2E-OK',
-  [int]$TimeoutSeconds = 240
+  [int]$TimeoutSeconds = 240,
+  # Also list every process the detached codex spawned, grouped by parent.
+  [switch]$Diagnose
 )
 
 Add-Type @'
@@ -31,6 +33,8 @@ public static class SigE2E {
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
   [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, StringBuilder s, int n);
+  public static string Title(long h) { var s = new StringBuilder(512); GetWindowText(new IntPtr(h), s, 512); return s.ToString(); }
   public static long[] ConsoleWindows() {
     var found = new List<long>();
     EnumWindows((h, _) => {
@@ -77,11 +81,26 @@ $procId = [SigE2E]::StartDetached($cmd, (Get-Location).Path)
 $proc = Get-Process -Id $procId
 
 $seen = @{}
+$tree = @{ $procId = $true }
+$spawned = @{}
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
-  foreach ($h in [SigE2E]::ConsoleWindows()) { if ($before -notcontains $h) { $seen[$h] = $true } }
+  foreach ($h in [SigE2E]::ConsoleWindows()) {
+    if ($before -notcontains $h) { $t = [SigE2E]::Title($h); if (-not $seen[$h] -or $t) { $seen[$h] = if ($t) { $t } else { '(untitled)' } } }
+  }
+  if ($Diagnose) {
+    # Record every descendant of the detached codex, with the parent that spawned it.
+    foreach ($p in Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine) {
+      if ($tree.ContainsKey([int]$p.ParentProcessId) -and -not $tree.ContainsKey([int]$p.ProcessId)) {
+        $tree[[int]$p.ProcessId] = $true
+        $parent = if ($spawned.ContainsKey([int]$p.ParentProcessId)) { $spawned[[int]$p.ParentProcessId].name } else { 'codex' }
+        $spawned[[int]$p.ProcessId] = [pscustomobject]@{ name = $p.Name; parent = $parent; cmd = "$($p.CommandLine)".Substring(0, [Math]::Min(140, "$($p.CommandLine)".Length)) }
+      }
+    }
+  }
   Start-Sleep -Milliseconds 100
 }
+if ($Diagnose) { Write-Host 'visible console windows by title:'; $seen.Values | Group-Object | Sort-Object Count -Descending | ForEach-Object { "{0,3}  {1}" -f $_.Count, $_.Name } | Write-Host; Write-Host 'spawned processes:'; $spawned.Values | Group-Object parent, name | Sort-Object Count -Descending | ForEach-Object { "{0,3}  {1}  e.g. {2}" -f $_.Count, $_.Name, $_.Group[0].cmd } | Write-Host }
 $timedOut = -not $proc.HasExited
 if ($timedOut) { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }
 

@@ -34,6 +34,62 @@
       "upstream": null,
       "reason": "ACP clients (Zed codex-acp) call account/login {type: apiKey}, which overwrote the shared ~/.codex/auth.json and broke the ChatGPT login for the CLI and daemon (401 Incorrect API key against chatgpt.com).",
       "drop_when": "Upstream fixes the auth.json clobber; tracked by docs/upstream-issues/app-server-apikey-clobbers-chatgpt-auth.md."
+    },
+    {
+      "subject": "cli: give console-less Codex a windowless console on Windows",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "Detached Codex still opened 17 console windows per turn after the upstream backports (git, hooks, helpers); one AllocConsoleWithOptions(NO_WINDOW) at startup covers every spawn site.",
+      "drop_when": "Upstream fixes console-less child windows at the root, or every spawn site sets CREATE_NO_WINDOW."
+    },
+    {
+      "subject": "app-server: test that API-key login keeps a persisted ChatGPT login",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "Regression test for the auth.json clobber patch.",
+      "drop_when": "Dropped together with the auth patch."
+    },
+    {
+      "subject": "plugins: stop re-cloning rejected marketplace revisions on every launch",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "A marketplace remote whose HEAD lost its manifest was ls-remoted and fully re-cloned on every launch.",
+      "drop_when": "Upstream records rejected marketplace revisions."
+    },
+    {
+      "subject": "models-manager: serve stale model catalog while revalidating in background",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "Launches more than 5 min after the last refresh blocked on a 522 KB GET /models.",
+      "drop_when": "Upstream serves the cached model list without blocking."
+    },
+    {
+      "subject": "cli: use mimalloc as the global allocator on Windows",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "Windows used the system heap; jemalloc was Linux-musl only. Impact not yet measured.",
+      "drop_when": "Measurement shows no benefit, or upstream adopts an allocator on Windows."
+    },
+    {
+      "subject": "perf(core): prewarm PowerShell version probe at session start",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "The first turn blocked ~300-350 ms on powershell.exe $PSVersionTable.",
+      "drop_when": "Upstream stops blocking the first turn on the probe."
+    },
+    {
+      "subject": "perf(skills): run shadow skill selection off the turn critical path",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "A shadow-selection experiment added ~60 ms to every turn.",
+      "drop_when": "Upstream removes the experiment or moves it off the turn path."
+    },
+    {
+      "subject": "perf(state): open and migrate runtime SQLite DBs concurrently",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "Five runtime SQLite DBs opened and migrated sequentially at startup.",
+      "drop_when": "Upstream opens them concurrently."
     }
   ]
 }
