@@ -2148,3 +2148,136 @@ async fn websocket_auth_rejection_after_handshake_recovers_credentials_before_re
     server.shutdown().await;
     Ok(())
 }
+
+fn api_http_client_key(request_url: &str) -> super::ApiHttpClientKey {
+    super::ApiHttpClientKey::new(
+        &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        request_url.to_string(),
+        codex_login::default_client::ClientRedirectPolicy::Default,
+    )
+}
+
+#[test]
+fn api_http_client_cache_reuses_clients_until_ttl_or_key_change() {
+    let cache = super::ApiHttpClientCache::default();
+    let builds = AtomicUsize::new(0);
+    let build = || {
+        builds.fetch_add(1, Ordering::Relaxed);
+        Ok::<_, std::convert::Infallible>(codex_login::default_client::create_client())
+    };
+    let now = std::time::Instant::now();
+    let responses = api_http_client_key("https://example.com/v1/responses");
+
+    for _ in 0..3 {
+        cache
+            .get_or_build(responses.clone(), now, build)
+            .expect("build client");
+    }
+    assert_eq!(builds.load(Ordering::Relaxed), 1);
+    assert_eq!(cache.len(), 1);
+
+    // Anything that shapes the built client gets its own entry.
+    let mut rejecting_redirects = responses.clone();
+    rejecting_redirects.redirect_policy = codex_login::default_client::ClientRedirectPolicy::Reject;
+    let mut changed_default_headers = responses.clone();
+    changed_default_headers
+        .default_headers
+        .insert("x-codex-residency", http::HeaderValue::from_static("us"));
+    let mut changed_ca_env = responses.clone();
+    changed_ca_env.env[0] = Some("C:/certs/corp.pem".into());
+    for key in [
+        api_http_client_key("https://example.com/v1/memories/trace_summarize"),
+        rejecting_redirects,
+        changed_default_headers,
+        changed_ca_env,
+    ] {
+        cache.get_or_build(key, now, build).expect("build client");
+    }
+    assert_eq!(builds.load(Ordering::Relaxed), 5);
+
+    // Entries expire so proxy/PAC resolution and OS root stores are periodically refreshed.
+    cache
+        .get_or_build(responses, now + super::API_HTTP_CLIENT_TTL, build)
+        .expect("rebuild client");
+    assert_eq!(builds.load(Ordering::Relaxed), 6);
+    assert_eq!(cache.len(), 1);
+}
+
+#[test]
+fn api_http_client_cache_is_bounded() {
+    let cache = super::ApiHttpClientCache::default();
+    let now = std::time::Instant::now();
+    for index in 0..(super::MAX_CACHED_API_HTTP_CLIENTS + 4) {
+        cache
+            .get_or_build(
+                api_http_client_key(&format!("https://example.com/v1/endpoint-{index}")),
+                now,
+                || Ok::<_, std::convert::Infallible>(codex_login::default_client::create_client()),
+            )
+            .expect("build client");
+    }
+    assert_eq!(cache.len(), super::MAX_CACHED_API_HTTP_CLIENTS);
+}
+
+#[tokio::test]
+async fn responses_http_requests_reuse_one_pooled_client_with_per_request_auth()
+-> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer test-provider-token",
+        ))
+        .respond_with(
+            ResponseTemplate::new(/*status*/ 200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+                )),
+        )
+        .expect(/*requests*/ 2)
+        .mount(&server)
+        .await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = false;
+    provider.experimental_bearer_token = Some("test-provider-token".to_string().into());
+    let client = websocket_test_client(create_model_provider(provider, /*auth_manager*/ None));
+    let prompt = Prompt::default();
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+
+    for _ in 0..2 {
+        let mut session = client.new_session();
+        let mut stream = session
+            .stream(
+                &prompt,
+                &test_model_info(),
+                &test_session_telemetry(),
+                /*effort*/ None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                /*service_tier*/ None,
+                &responses_metadata,
+                &InferenceTraceContext::disabled(),
+            )
+            .await?;
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            if let ResponseEvent::Completed { .. } = event? {
+                completed = true;
+            }
+        }
+        assert!(completed);
+    }
+
+    assert_eq!(client.state.api_http_clients.len(), 1);
+    server.verify().await;
+    Ok(())
+}
