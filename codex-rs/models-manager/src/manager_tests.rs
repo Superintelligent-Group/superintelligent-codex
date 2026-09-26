@@ -1150,7 +1150,7 @@ async fn online_refresh_updates_access_programs_with_unchanged_etag() {
         );
         assert_eq!(manager.get_remote_models().await, vec![model]);
         assert_eq!(
-            manager.remote_models.read().await.etag.as_deref(),
+            manager.inner.remote_models.read().await.etag.as_deref(),
             Some("stable-catalog-etag")
         );
 
@@ -1169,15 +1169,41 @@ async fn online_refresh_updates_access_programs_with_unchanged_etag() {
         );
         assert_eq!(cache_endpoint.fetch_count(), 0);
         assert_eq!(
-            cache_manager.remote_models.read().await.etag.as_deref(),
+            cache_manager
+                .inner
+                .remote_models
+                .read()
+                .await
+                .etag
+                .as_deref(),
             Some("stable-catalog-etag")
         );
     }
     assert_eq!(endpoint.fetch_count(), 2);
 }
 
+/// Poll until the background refresh publishes `expected` or the deadline passes.
+async fn wait_for_remote_models(manager: &OpenAiModelsManager, expected: &[ModelInfo]) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = manager.get_remote_models().await;
+            if expected.iter().all(|model| current.contains(model))
+                && !manager
+                    .inner
+                    .background_refresh_in_flight
+                    .load(Ordering::SeqCst)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background refresh should publish the fresh catalog");
+}
+
 #[tokio::test]
-async fn refresh_available_models_refetches_when_cache_stale() {
+async fn stale_cache_is_served_immediately_and_revalidated_in_background() {
     let initial_models = vec![remote_model("stale", "Stale", /*priority*/ 1)];
     let codex_home = tempdir().expect("temp dir");
     let updated_models = vec![remote_model("fresh", "Fresh", /*priority*/ 9)];
@@ -1194,9 +1220,89 @@ async fn refresh_available_models_refetches_when_cache_stale() {
 
     // Rewrite cache with an old timestamp so it is treated as stale.
     mutate_file_cache_for_test(codex_home.path(), |cache| {
+        cache.fetched_at = Utc::now() - chrono::Duration::days(30);
+    })
+    .await;
+
+    // A fresh manager (a new process) must serve the stale catalog without waiting on the
+    // network, then revalidate in the background.
+    let restarted = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    restarted
+        .refresh_available_models(
+            RefreshStrategy::OnlineIfUncached,
+            &DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("stale refresh succeeds");
+    assert_models_contain(&restarted.get_remote_models().await, &initial_models);
+
+    wait_for_remote_models(&restarted, &updated_models).await;
+    assert_eq!(
+        endpoint.fetch_count(),
+        2,
+        "stale cache should trigger exactly one background fetch"
+    );
+
+    // The background refresh rewrote the disk cache, so the next caller gets a fresh hit.
+    let next = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    next.refresh_available_models(
+        RefreshStrategy::OnlineIfUncached,
+        &DEFAULT_HTTP_CLIENT_FACTORY,
+    )
+    .await
+    .expect("fresh cache refresh succeeds");
+    assert_models_contain(&next.get_remote_models().await, &updated_models);
+    assert_eq!(
+        endpoint.fetch_count(),
+        2,
+        "fresh cache should avoid a fetch"
+    );
+}
+
+#[tokio::test]
+async fn repeated_stale_reads_share_one_background_refresh() {
+    let initial_models = vec![remote_model("stale", "Stale", /*priority*/ 1)];
+    let codex_home = tempdir().expect("temp dir");
+    let updated_models = vec![remote_model("fresh", "Fresh", /*priority*/ 9)];
+    let endpoint = TestModelsEndpoint::new(vec![
+        initial_models.clone(),
+        updated_models.clone(),
+        updated_models.clone(),
+    ]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    manager
+        .refresh_available_models(
+            RefreshStrategy::OnlineIfUncached,
+            &DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("initial refresh succeeds");
+    mutate_file_cache_for_test(codex_home.path(), |cache| {
         cache.fetched_at = Utc::now() - chrono::Duration::hours(1);
     })
     .await;
+
+    // Either the second call sees the in-flight refresh, or the refresh has already written a
+    // fresh cache. Both paths must avoid a second network fetch.
+    for _ in 0..3 {
+        manager
+            .refresh_available_models(
+                RefreshStrategy::OnlineIfUncached,
+                &DEFAULT_HTTP_CLIENT_FACTORY,
+            )
+            .await
+            .expect("stale refresh succeeds");
+    }
+    wait_for_remote_models(&manager, &updated_models).await;
+    assert_eq!(endpoint.fetch_count(), 2);
+}
+
+#[tokio::test]
+async fn missing_cache_still_blocks_on_fetch() {
+    let remote_models = vec![remote_model("remote", "Remote", /*priority*/ 0)];
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
 
     manager
         .refresh_available_models(
@@ -1204,12 +1310,51 @@ async fn refresh_available_models_refetches_when_cache_stale() {
             &DEFAULT_HTTP_CLIENT_FACTORY,
         )
         .await
-        .expect("second refresh succeeds");
-    assert_models_contain(&manager.get_remote_models().await, &updated_models);
+        .expect("refresh succeeds");
+    assert_eq!(endpoint.fetch_count(), 1);
+    assert_models_contain(&manager.get_remote_models().await, &remote_models);
+    assert!(
+        !manager
+            .inner
+            .background_refresh_in_flight
+            .load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn file_cache_load_stale_ignores_age_but_not_client_version() {
+    let codex_home = tempdir().expect("temp dir");
+    let cache = FileModelsCache::new(
+        codex_home.path().join(MODEL_CACHE_FILE),
+        DEFAULT_MODEL_CACHE_TTL,
+    );
+    let client_version = crate::client_version_to_whole();
+    let entry = ModelsCacheEntry {
+        identity: Some("test-provider".to_string()),
+        fetched_at: Utc::now() - chrono::Duration::days(365),
+        etag: None,
+        client_version: Some(client_version.clone()),
+        models: vec![remote_model("ancient", "Ancient", /*priority*/ 0)],
+    };
+    cache.store(&entry).await.expect("cache store succeeds");
+
     assert_eq!(
-        endpoint.fetch_count(),
-        2,
-        "stale cache refresh should fetch models again"
+        cache.load(&client_version).await.expect("load succeeds"),
+        None
+    );
+    assert_eq!(
+        cache
+            .load_stale(&client_version)
+            .await
+            .expect("stale load succeeds"),
+        Some(entry)
+    );
+    assert_eq!(
+        cache
+            .load_stale("other-version")
+            .await
+            .expect("stale load succeeds"),
+        None
     );
 }
 

@@ -33,6 +33,20 @@ pub trait ModelsCache: fmt::Debug + Send + Sync {
         client_version: &'a str,
     ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>>;
 
+    /// Loads the stored entry for `client_version` regardless of its age.
+    ///
+    /// The models manager uses this for stale-while-revalidate: when no fresh entry exists, a
+    /// stale catalog is served immediately while a background refresh fetches the latest one.
+    /// Implementations must still omit entries for a different client version. The default
+    /// implementation reports a miss, so custom caches keep blocking-refresh behavior unless they
+    /// opt in.
+    fn load_stale<'a>(
+        &'a self,
+        _client_version: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
+
     /// Stores `entry`, replacing the snapshot for this cache implementation's lookup identity.
     ///
     /// The implementation derives that identity from its own configuration and the entry metadata.
@@ -147,6 +161,25 @@ impl ModelsCache for FileModelsCache {
         )
     }
 
+    fn load_stale<'a>(
+        &'a self,
+        client_version: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
+        Box::pin(async move {
+            // A zero TTL disables cache reuse entirely, including stale-while-revalidate.
+            if self.cache_ttl.is_zero() {
+                return Ok(None);
+            }
+            let Some(cache) = load_file(&self.cache_path).await.map_err(cache_error)? else {
+                return Ok(None);
+            };
+            if cache.client_version.as_deref() != Some(client_version) {
+                return Ok(None);
+            }
+            Ok(Some(cache))
+        })
+    }
+
     fn store<'a>(
         &'a self,
         entry: &'a ModelsCacheEntry,
@@ -240,6 +273,22 @@ async fn save_file(cache_path: &PathBuf, cache: &ModelsCacheEntry) -> Result<(),
         fs::create_dir_all(parent).await.map_err(cache_error)?;
     }
     let json = serde_json::to_vec_pretty(cache).map_err(cache_error)?;
+    // Write a sibling temp file and rename it into place so concurrent readers (a background
+    // refresh racing a foreground read, or another Codex process) never see a truncated file,
+    // which would parse as "no cache" and force a blocking fetch.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let mut tmp_name = cache_path.as_os_str().to_owned();
+    tmp_name.push(format!(".tmp-{}-{nanos}", std::process::id()));
+    let tmp_path = PathBuf::from(tmp_name);
+    fs::write(&tmp_path, &json).await.map_err(cache_error)?;
+    if fs::rename(&tmp_path, cache_path).await.is_ok() {
+        return Ok(());
+    }
+    // Windows refuses to replace a file another process holds open; fall back to an in-place write.
+    let _ = fs::remove_file(&tmp_path).await;
     fs::write(cache_path, json).await.map_err(cache_error)
 }
 
