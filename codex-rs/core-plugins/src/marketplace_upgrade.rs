@@ -1,5 +1,6 @@
 mod activation;
 mod git;
+mod rejection;
 
 use self::activation::activate_marketplace_root;
 use self::activation::installed_marketplace_metadata_matches;
@@ -7,6 +8,9 @@ use self::activation::read_installed_marketplace_snapshot;
 use self::activation::write_installed_marketplace_metadata;
 use self::git::clone_git_source;
 use self::git::git_remote_revision;
+use self::rejection::clear_rejected_revision;
+use self::rejection::record_rejected_revision;
+use self::rejection::rejected_revision_reason;
 use crate::PluginGitMode;
 use crate::installed_marketplaces::marketplace_install_root;
 use crate::marketplace::validate_marketplace_root;
@@ -21,11 +25,19 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
+use tracing::debug;
+use tracing::warn;
 
 /// Reloads configuration with the initiating operation's settings. Called only on a blocking worker.
 pub type ConfigLayerReload = Arc<dyn Fn() -> std::io::Result<ConfigLayerStack> + Send + Sync>;
 
 const MARKETPLACE_UPGRADE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const MARKETPLACE_UPGRADE_STAGING_DIR: &str = ".staging";
+const MARKETPLACE_UPGRADE_STAGING_PREFIX: &str = "marketplace-upgrade-";
+/// Staging directories are normally removed when an upgrade finishes; anything this old was
+/// orphaned by a crash, a killed process, or a Windows file lock and is never reused.
+const STALE_STAGING_DIR_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredMarketplaceUpgradeError {
@@ -109,6 +121,10 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
     }
 
     let install_root = marketplace_install_root(codex_home);
+    remove_stale_staging_dirs(
+        &install_root.join(MARKETPLACE_UPGRADE_STAGING_DIR),
+        STALE_STAGING_DIR_MAX_AGE,
+    );
     let mut selected_marketplaces = marketplaces
         .iter()
         .map(|marketplace| marketplace.name.clone())
@@ -253,8 +269,21 @@ fn upgrade_configured_git_marketplace(
     {
         return Ok(None);
     }
+    // Automatic runs skip a remote revision that already failed validation; a manual upgrade
+    // always retries so users can force it.
+    if mode == PluginGitMode::Automatic
+        && let Some(reason) = rejected_revision_reason(install_root, marketplace, &remote_revision)
+    {
+        debug!(
+            marketplace = %marketplace.name,
+            revision = %remote_revision,
+            reason = %reason,
+            "skipping previously rejected marketplace revision"
+        );
+        return Ok(None);
+    }
 
-    let staging_parent = install_root.join(".staging");
+    let staging_parent = install_root.join(MARKETPLACE_UPGRADE_STAGING_DIR);
     std::fs::create_dir_all(&staging_parent).map_err(|err| {
         format!(
             "failed to create marketplace upgrade staging directory {}: {err}",
@@ -262,7 +291,7 @@ fn upgrade_configured_git_marketplace(
         )
     })?;
     let staged_dir = tempfile::Builder::new()
-        .prefix("marketplace-upgrade-")
+        .prefix(MARKETPLACE_UPGRADE_STAGING_PREFIX)
         .tempdir_in(&staging_parent)
         .map_err(|err| {
             format!(
@@ -280,23 +309,68 @@ fn upgrade_configured_git_marketplace(
         MARKETPLACE_UPGRADE_GIT_TIMEOUT,
         mode,
     )?;
-    let marketplace_name = validate_marketplace_root(staged_dir.path())
-        .map_err(|err| format!("failed to validate upgraded marketplace root: {err}"))?;
-    if marketplace_name != marketplace.name {
-        return Err(format!(
+    // A clone that succeeded but is not a valid marketplace fails the same way until the remote
+    // moves, so remember the revision instead of re-cloning it on every automatic run.
+    let rejection = match validate_marketplace_root(staged_dir.path()) {
+        Err(err) => Some(format!(
+            "failed to validate upgraded marketplace root: {err}"
+        )),
+        Ok(marketplace_name) if marketplace_name != marketplace.name => Some(format!(
             "upgraded marketplace name `{marketplace_name}` does not match configured marketplace `{}`",
             marketplace.name
-        ));
+        )),
+        Ok(_) => None,
+    };
+    if let Some(reason) = rejection {
+        record_rejected_revision(install_root, marketplace, &remote_revision, &reason);
+        return Err(reason);
     }
     write_installed_marketplace_metadata(staged_dir.path(), marketplace, &activated_revision)?;
     activate_marketplace_root(&destination, staged_dir, &previous_snapshot, || {
         ensure_configured_git_marketplace_unchanged(reload_config, marketplace)
     })?;
+    clear_rejected_revision(install_root, &marketplace.name);
 
     AbsolutePathBuf::try_from(destination)
         .map(Some)
         .map_err(|err| format!("upgraded marketplace path is not absolute: {err}"))
 }
+
+/// Best-effort removal of upgrade staging directories orphaned by earlier runs.
+fn remove_stale_staging_dirs(staging_parent: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(staging_parent) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let is_staging_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(MARKETPLACE_UPGRADE_STAGING_PREFIX));
+        if !is_staging_dir {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if !is_stale {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(err) = std::fs::remove_dir_all(&path) {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to remove stale marketplace upgrade staging directory"
+            );
+        }
+    }
+}
+
 fn ensure_configured_git_marketplace_unchanged(
     reload_config: &ConfigLayerReload,
     expected: &ConfiguredGitMarketplace,
