@@ -11,6 +11,8 @@ use futures::future::WeakShared;
 
 use crate::info::detect_local_fsmonitor_override;
 use crate::info::run_git_command_with_timeout_from;
+use crate::metadata_cache::MetadataKind;
+use crate::metadata_cache::cached_git_metadata;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct GitStatusKey {
@@ -31,7 +33,15 @@ pub async fn get_has_changes_in_repo(cwd: &Path, repo_root: &Path) -> Option<boo
     let cwd = cwd.to_path_buf();
     let key = git_status_key(git.clone(), repo_root).await;
     share_git_status_run(key, move || async move {
-        let fsmonitor = detect_local_fsmonitor_override(&git, &cwd).await;
+        // The probe depends only on effective Git config, which the metadata
+        // cache fingerprints; `status` itself always runs.
+        let (probe_git, probe_cwd) = (git.clone(), cwd.clone());
+        let fsmonitor =
+            cached_git_metadata(&cwd, MetadataKind::FsmonitorOverride, move || async move {
+                Some(detect_local_fsmonitor_override(&probe_git, &probe_cwd).await)
+            })
+            .await
+            .unwrap_or(crate::FsmonitorOverride::Disabled);
         let output =
             run_git_command_with_timeout_from(&git, &["status", "--porcelain"], &cwd, fsmonitor)
                 .await?;
