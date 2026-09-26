@@ -61,6 +61,7 @@ use crate::render_observability::CatalogSurface;
 use crate::render_observability::record_catalog_render;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::shadow_selection_experiment::ShadowSelectionExperiment;
+use crate::shadow_selection_experiment::ShadowSelectionRequest;
 use crate::sources::SkillProviders;
 use crate::state::ExecutorSkillsStepState;
 use crate::state::HostSkillsCatalogInWorldState;
@@ -337,10 +338,8 @@ where
         Box::pin(async move {
             match input.kind {
                 SkillInvocationKind::Implicit => {
-                    if let Some(state) = input
-                        .thread_store
-                        .get::<SkillsThreadState>()
-                        .and_then(|state| state.shadow_selection_turn(input.turn_id))
+                    if let Some(thread_state) = input.thread_store.get::<SkillsThreadState>()
+                        && let Some(state) = thread_state.shadow_selection_turn(input.turn_id).await
                     {
                         self.shadow_selection
                             .record_invocation(&state, input.skill_resource);
@@ -405,14 +404,24 @@ where
                 }
                 let shadow_selected_entries =
                     collect_explicit_skill_mentions(&input.user_input, &shadow_catalog);
-                Some(self.shadow_selection.run(
-                    &input,
-                    &shadow_catalog,
-                    &shadow_selected_entries,
-                    host_snapshot.as_deref(),
-                    Arc::clone(&thread_state.recent_skill_invocations),
-                    Arc::clone(&thread_state.shadow_task_context),
-                ))
+                // Telemetry-only: evaluate off the critical path. The skills
+                // injected below come solely from `selected_entries`.
+                let pending = self.shadow_selection.spawn(
+                    thread_state.shadow_selection_tail(),
+                    ShadowSelectionRequest {
+                        turn_id: input.turn_id.clone(),
+                        user_input: input.user_input.clone(),
+                        catalog: shadow_catalog,
+                        explicitly_selected: shadow_selected_entries,
+                        host_snapshot: host_snapshot.clone(),
+                        recent_skill_invocations: Arc::clone(
+                            &thread_state.recent_skill_invocations,
+                        ),
+                        task_context: Arc::clone(&thread_state.shadow_task_context),
+                    },
+                );
+                thread_state.set_shadow_selection_tail(pending.clone());
+                Some(pending)
             } else {
                 None
             };

@@ -220,6 +220,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ReadTool {
                             .context
                             .thread_state
                             .shadow_selection_turn(&call.turn_id)
+                            .await
                     {
                         self.context
                             .shadow_selection

@@ -21,6 +21,7 @@ use crate::catalog::SkillReadResult;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
+use crate::shadow_selection_experiment::PendingShadowSelection;
 use crate::shadow_selection_experiment::RecentSkillInvocations;
 use crate::shadow_selection_experiment::ShadowSelectionTurnState;
 use crate::shadow_selection_experiment::ShadowTaskContext;
@@ -47,6 +48,8 @@ pub struct SkillsThreadState {
     cloud_skills_available: bool,
     skills_extension_state: Mutex<SkillsExtensionState>,
     shadow_selection_turn: Mutex<Option<ShadowSelectionTurn>>,
+    /// Most recently started shadow evaluation, used to chain the next one.
+    shadow_selection_tail: Mutex<Option<PendingShadowSelection>>,
     pub(crate) executor_read_snapshot: Mutex<Option<ExecutorReadSnapshot>>,
     pub(crate) recent_skill_invocations: Arc<RecentSkillInvocations>,
     pub(crate) shadow_task_context: Arc<ShadowTaskContext>,
@@ -59,6 +62,7 @@ impl SkillsThreadState {
             cloud_skills_available,
             skills_extension_state: Mutex::new(SkillsExtensionState::default()),
             shadow_selection_turn: Mutex::new(None),
+            shadow_selection_tail: Mutex::new(None),
             executor_read_snapshot: Mutex::new(None),
             recent_skill_invocations: Arc::new(RecentSkillInvocations::default()),
             shadow_task_context: Arc::new(ShadowTaskContext::default()),
@@ -94,28 +98,45 @@ impl SkillsThreadState {
     pub(crate) fn replace_shadow_selection_turn(
         &self,
         turn_id: String,
-        state: Option<ShadowSelectionTurnState>,
+        state: Option<PendingShadowSelection>,
     ) {
         *self
             .shadow_selection_turn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            state.map(|state| ShadowSelectionTurn {
-                turn_id,
-                state: Arc::new(state),
-            });
+            state.map(|state| ShadowSelectionTurn { turn_id, state });
     }
 
-    pub(crate) fn shadow_selection_turn(
+    /// Records `next` as the latest shadow evaluation so the following one
+    /// can be chained behind it.
+    pub(crate) fn set_shadow_selection_tail(&self, next: PendingShadowSelection) {
+        *self
+            .shadow_selection_tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
+    }
+
+    /// Returns the previous shadow evaluation for chaining, if any.
+    pub(crate) fn shadow_selection_tail(&self) -> Option<PendingShadowSelection> {
+        self.shadow_selection_tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Waits for this turn's background shadow evaluation, if one exists.
+    pub(crate) async fn shadow_selection_turn(
         &self,
         turn_id: &str,
     ) -> Option<Arc<ShadowSelectionTurnState>> {
-        self.shadow_selection_turn
+        let pending = self
+            .shadow_selection_turn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .filter(|turn| turn.turn_id == turn_id)
-            .map(|turn| Arc::clone(&turn.state))
+            .map(|turn| turn.state.clone())?;
+        pending.await
     }
 
     /// Refreshes the current step's executor catalog in the existing caches.
@@ -443,7 +464,7 @@ pub(crate) struct ExecutorReadSnapshot {
 
 struct ShadowSelectionTurn {
     turn_id: String,
-    state: Arc<ShadowSelectionTurnState>,
+    state: PendingShadowSelection,
 }
 
 #[derive(Default)]
