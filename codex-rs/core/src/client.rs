@@ -71,12 +71,16 @@ use codex_api::auth_header_telemetry;
 use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
 use codex_login::UnauthorizedRecovery;
+use codex_login::default_client::ClientRedirectPolicy;
 use codex_login::default_client::add_originator_header;
+use codex_login::default_client::create_client_for_route;
 use codex_otel::SessionTelemetry;
 use codex_otel::WEBSOCKET_CONTINUATION_COUNT_METRIC;
 use codex_otel::current_span_w3c_trace_context;
@@ -218,6 +222,7 @@ struct ModelClientState {
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
+    api_http_clients: ApiHttpClientCache,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
     /// Last full tool list used for sampling, retained across turns and connection resets.
@@ -567,7 +572,141 @@ pub(crate) struct RealtimeWebrtcCallStart {
     pub(crate) sideband_http_client_factory: HttpClientFactory,
 }
 
+/// How long a pooled API HTTP client is reused before it is rebuilt.
+///
+/// Rebuilding periodically picks up changes the cache key cannot observe cheaply: system/PAC proxy
+/// resolution, OS root-store updates, and edits to a custom CA file at an unchanged path.
+const API_HTTP_CLIENT_TTL: Duration = Duration::from_secs(5 * 60);
+/// Upper bound on distinct pooled API HTTP clients (endpoints x redirect policies x configs).
+const MAX_CACHED_API_HTTP_CLIENTS: usize = 16;
+/// Environment variables read when a client is built; a change forces a rebuild.
+const API_HTTP_CLIENT_ENV_VARS: &[&str] = &[
+    "CODEX_CA_CERTIFICATE",
+    "SSL_CERT_FILE",
+    "CODEX_SANDBOX",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+/// Everything that shapes a built API HTTP client. Auth is not part of the key: credentials are
+/// applied to each request by the API auth provider, never baked into the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApiHttpClientKey {
+    http_client_factory: HttpClientFactory,
+    request_url: String,
+    redirect_policy: ClientRedirectPolicy,
+    /// Process-wide default headers (originator, user agent, residency) captured at build time.
+    default_headers: ApiHeaderMap,
+    env: Vec<Option<std::ffi::OsString>>,
+}
+
+impl ApiHttpClientKey {
+    fn new(
+        http_client_factory: &HttpClientFactory,
+        request_url: String,
+        redirect_policy: ClientRedirectPolicy,
+    ) -> Self {
+        Self {
+            http_client_factory: http_client_factory.clone(),
+            request_url,
+            redirect_policy,
+            default_headers: codex_login::default_client::default_headers(),
+            env: API_HTTP_CLIENT_ENV_VARS
+                .iter()
+                .map(std::env::var_os)
+                .collect(),
+        }
+    }
+}
+
+/// Reuses built API HTTP clients so requests share one connection pool and TLS roots load once
+/// per distinct configuration instead of once per request.
+#[derive(Debug, Default)]
+struct ApiHttpClientCache {
+    entries: StdMutex<Vec<(ApiHttpClientKey, Instant, HttpClient)>>,
+}
+
+impl ApiHttpClientCache {
+    fn get_or_build<E>(
+        &self,
+        key: ApiHttpClientKey,
+        now: Instant,
+        build: impl FnOnce() -> std::result::Result<HttpClient, E>,
+    ) -> std::result::Result<HttpClient, E> {
+        {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries.retain(|(_, built_at, _)| now.duration_since(*built_at) < API_HTTP_CLIENT_TTL);
+            if let Some((_, _, client)) = entries.iter().find(|(cached, _, _)| *cached == key) {
+                return Ok(client.clone());
+            }
+        }
+        // Build outside the lock: client construction loads TLS roots and may resolve proxies.
+        let client = build()?;
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, _, existing)) = entries.iter().find(|(cached, _, _)| *cached == key) {
+            return Ok(existing.clone());
+        }
+        if entries.len() >= MAX_CACHED_API_HTTP_CLIENTS {
+            entries.remove(0);
+        }
+        entries.push((key, now, client.clone()));
+        Ok(client)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
 impl ModelClient {
+    /// Reuse transport state only; upstream resolves auth and routing for every attempt.
+    fn pooled_api_transport(
+        &self,
+        setup: &CurrentClientSetup,
+        endpoint: &str,
+    ) -> Result<codex_api::ReqwestTransport> {
+        let redirect_policy = if setup
+            .api_provider
+            .headers
+            .contains_key(codex_model_provider::ACCOUNT_ROUTING_HEADER)
+        {
+            ClientRedirectPolicy::Reject
+        } else {
+            setup.redirect_policy
+        };
+        let url = setup.api_provider.url_for_path(endpoint);
+        let key = ApiHttpClientKey::new(&setup.http_client_factory, url.clone(), redirect_policy);
+        let client = self
+            .state
+            .api_http_clients
+            .get_or_build(key, Instant::now(), || {
+                create_client_for_route(
+                    &setup.http_client_factory,
+                    &url,
+                    ClientRouteClass::Api,
+                    redirect_policy,
+                )
+            })
+            .map_err(std::io::Error::from)?;
+        Ok(codex_api::ReqwestTransport::from_http_client(client))
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Creates a new session-scoped `ModelClient`.
     ///
@@ -632,6 +771,7 @@ impl ModelClient {
                 include_attestation,
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
+                api_http_clients: ApiHttpClientCache::default(),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 last_inference_tools: StdMutex::new(None),
@@ -956,7 +1096,7 @@ impl ModelClient {
                 Some(&setup),
             )
             .await?;
-        let transport = setup.http_transport(REALTIME_CALLS_ENDPOINT)?;
+        let transport = self.pooled_api_transport(&setup, REALTIME_CALLS_ENDPOINT)?;
         let response = ApiRealtimeCallClient::new(transport, setup.api_provider, setup.api_auth)
             .create_with_session_and_headers(sdp, session_config, extra_headers.clone())
             .await
@@ -1017,7 +1157,7 @@ impl ModelClient {
         let client_setup = self
             .current_client_setup(ClientRouting::ConfiguredProvider)
             .await?;
-        let transport = client_setup.http_transport(MEMORIES_SUMMARIZE_ENDPOINT)?;
+        let transport = self.pooled_api_transport(&client_setup, MEMORIES_SUMMARIZE_ENDPOINT)?;
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
             AuthRequestTelemetryContext::new(
@@ -2001,7 +2141,9 @@ impl ResponsesHttpExecutor<'_> {
                 .client
                 .responses_headers(client_setup.auth.as_ref(), &model_info.slug);
             tracing::Span::current().record("api.path", "/responses");
-            let transport = client_setup.http_transport("/responses")?;
+            let transport = self
+                .client
+                .pooled_api_transport(&client_setup, "/responses")?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
