@@ -436,6 +436,7 @@ lru = "0.18.2"
 maplit = "1.0.2"
 memchr = "2.7.6"
 mime_guess = "2.0.5"
+mimalloc = { version = "=0.1.52", default-features = false }
 multimap = "0.10.0"
 mxc-sdk = { git = "https://github.com/microsoft/mxc", rev = "b21120168d70befe12356411423266bfef168446" }
 notify = "8.2.0"
