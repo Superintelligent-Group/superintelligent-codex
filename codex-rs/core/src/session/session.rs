@@ -1574,6 +1574,11 @@ impl Session {
                 .user_shell_override
                 .clone()
                 .unwrap_or_else(shell::default_user_shell);
+            if config.features.enabled(Feature::PowerShellShellVersion)
+                && default_shell.shell_type == shell::ShellType::PowerShell
+            {
+                crate::context::world_state::prewarm_powershell_version(default_shell.shell_path.clone());
+            }
             let credential_broker_available = (config.features.enabled(Feature::NetworkProxy)
                 || config.features.enabled(Feature::CredentialMasking))
                 && config

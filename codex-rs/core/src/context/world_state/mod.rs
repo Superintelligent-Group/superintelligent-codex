@@ -53,6 +53,7 @@ pub(crate) use context_window_guidance::ContextWindowGuidanceState;
 pub(crate) use environment::EnvironmentsState;
 use environment::RenderedEnvironments;
 pub(crate) use environment::format_agent_paths;
+pub(crate) use environment::prewarm_powershell_version;
 pub(crate) use environments_instructions::EnvironmentsInstructionsState;
 pub(crate) use managed_developer_instructions::ManagedDeveloperInstructions;
 pub(crate) use managed_developer_instructions::ManagedDeveloperInstructionsState;
