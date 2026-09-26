@@ -325,6 +325,19 @@ pub fn validate_marketplace_root(root: &Path) -> Result<String, MarketplaceError
     Ok(marketplace.name)
 }
 
+/// Only content/layout failures remain invalid at an unchanged Git revision.
+/// Metadata failures hidden by `Path::is_file` must remain retryable too.
+pub(crate) fn validation_error_is_deterministic(root: &Path, error: &MarketplaceError) -> bool {
+    matches!(error, MarketplaceError::InvalidMarketplaceFile { .. })
+        && fs::metadata(root).is_ok_and(|metadata| metadata.is_dir())
+        && MARKETPLACE_MANIFEST_RELATIVE_PATHS.iter().all(|relative| {
+            match fs::metadata(root.join(relative)) {
+                Ok(_) => true,
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
+            }
+        })
+}
+
 pub fn find_marketplace_manifest_path(root: &Path) -> Option<AbsolutePathBuf> {
     MARKETPLACE_MANIFEST_RELATIVE_PATHS
         .iter()

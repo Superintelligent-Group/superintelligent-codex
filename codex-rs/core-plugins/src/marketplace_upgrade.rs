@@ -1,5 +1,6 @@
 mod activation;
 mod git;
+mod rejection;
 
 use self::activation::activate_marketplace_root;
 use self::activation::installed_marketplace_metadata_matches;
@@ -8,6 +9,9 @@ use self::activation::write_installed_marketplace_metadata;
 use self::git::checkout_git_source;
 use self::git::git_remote_revision;
 use self::git::stage_git_clone;
+use self::rejection::clear_rejected_revision;
+use self::rejection::record_validation_rejection;
+use self::rejection::rejected_revision_reason;
 use crate::PluginGitMode;
 use crate::installed_marketplaces::marketplace_install_root;
 use crate::marketplace::has_symlinked_marketplace_manifest;
@@ -277,6 +281,13 @@ fn upgrade_configured_git_marketplace(
         return Ok(None);
     }
 
+    if mode == PluginGitMode::Automatic
+        && let Some(reason) = rejected_revision_reason(install_root, marketplace, &remote_revision)
+    {
+        tracing::debug!(marketplace = %marketplace.name, reason = %reason, "skipping previously rejected marketplace revision");
+        return Ok(None);
+    }
+
     let name_mismatch = |found: &str| {
         format!(
             "upgraded marketplace name `{found}` does not match configured marketplace `{}`",
@@ -300,7 +311,7 @@ fn upgrade_configured_git_marketplace(
                     .iter()
                     .map(|path| Box::from(path.as_str()))
                     .collect(),
-                revision: remote_revision.into_boxed_str(),
+                revision: remote_revision.clone().into_boxed_str(),
             };
             Some((path, inputs))
         }
@@ -324,8 +335,21 @@ fn upgrade_configured_git_marketplace(
     )?;
     let activated_revision =
         checkout_git_source(staged_dir.path(), ref_name, &marketplace.sparse_paths, mode)?;
-    let marketplace_name = validate_marketplace_root(staged_dir.path())
-        .map_err(|err| format!("failed to validate upgraded marketplace root: {err}"))?;
+    let marketplace_name = match validate_marketplace_root(staged_dir.path()) {
+        Ok(name) => name,
+        Err(err) => {
+            let reason = format!("failed to validate upgraded marketplace root: {err}");
+            record_validation_rejection(
+                install_root,
+                marketplace,
+                &remote_revision,
+                &activated_revision,
+                staged_dir.path(),
+                &err,
+            );
+            return Err(reason);
+        }
+    };
     if marketplace_name != marketplace.name {
         let error = name_mismatch(&marketplace_name);
         // HEAD may have moved since ls-remote. Only cache the revision we validated.
@@ -345,6 +369,8 @@ fn upgrade_configured_git_marketplace(
     activate_marketplace_root(&destination, staged_dir.path(), &previous_snapshot, || {
         ensure_configured_git_marketplace_unchanged(reload_config, marketplace)
     })?;
+
+    clear_rejected_revision(install_root, &marketplace.name);
 
     AbsolutePathBuf::try_from(destination)
         .map(Some)

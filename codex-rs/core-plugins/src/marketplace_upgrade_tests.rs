@@ -637,3 +637,180 @@ fn run_git(repo: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn rejected_remote_revision_is_skipped_automatically_until_remote_moves() {
+    let codex_home = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    init_marketplace_repo(remote.path(), "good");
+    let source = url::Url::from_directory_path(remote.path())
+        .unwrap()
+        .to_string();
+    let system = format!("[marketplaces.good]\nsource_type = \"git\"\nsource = {source:?}\n");
+    let stack = system_marketplace_stack(codex_home.path(), &system, "");
+    let reload_config = config_reloader(codex_home.path());
+    let install_root = marketplace_install_root(codex_home.path());
+    let root = AbsolutePathBuf::try_from(install_root.join("good")).unwrap();
+    let rejection = install_root.join(".upgrade-rejections/good.json");
+    let run = |mode| {
+        upgrade_configured_git_marketplaces_with_mode(
+            codex_home.path(),
+            &stack,
+            Some("good"),
+            mode,
+            &reload_config,
+        )
+    };
+
+    assert_eq!(
+        run(PluginGitMode::Automatic).upgraded_roots,
+        vec![root.clone()]
+    );
+    let installed_metadata = std::fs::read(root.join(".codex-marketplace-install.json")).unwrap();
+
+    // The remote moves to a revision that no longer contains a marketplace manifest.
+    run_git(remote.path(), &["rm", "-r", "--quiet", ".agents"]);
+    std::fs::write(remote.path().join("README.md"), "no manifest").unwrap();
+    run_git(remote.path(), &["add", "."]);
+    run_git(remote.path(), &["commit", "-m", "drop manifest"]);
+
+    let first = run(PluginGitMode::Automatic);
+    assert_eq!(first.upgraded_roots, Vec::new());
+    assert_eq!(first.errors.len(), 1);
+    assert!(
+        first.errors[0]
+            .message
+            .contains("failed to validate upgraded marketplace root"),
+        "{}",
+        first.errors[0].message
+    );
+    assert!(rejection.exists());
+
+    // Later automatic runs keep the installed snapshot without re-cloning or re-reporting.
+    let repeated = run(PluginGitMode::Automatic);
+    assert_eq!(
+        repeated,
+        ConfiguredMarketplaceUpgradeOutcome {
+            selected_marketplaces: vec!["good".to_string()],
+            upgraded_roots: Vec::new(),
+            errors: Vec::new(),
+        }
+    );
+    assert_eq!(
+        std::fs::read(root.join(".codex-marketplace-install.json")).unwrap(),
+        installed_metadata
+    );
+    assert!(validate_marketplace_root(root.as_path()).is_ok());
+
+    // A manual upgrade ignores the negative cache and retries.
+    assert_eq!(run(PluginGitMode::Manual).errors.len(), 1);
+
+    // A new remote revision is tried again and clears the rejection on success.
+    init_marketplace_manifest(remote.path(), "good");
+    run_git(remote.path(), &["add", "."]);
+    run_git(remote.path(), &["commit", "-m", "restore manifest"]);
+    let recovered = run(PluginGitMode::Automatic);
+    assert_eq!(recovered.errors, Vec::new());
+    assert_eq!(recovered.upgraded_roots, vec![root.clone()]);
+    assert!(root.join("README.md").exists());
+    assert!(!rejection.exists());
+}
+
+#[test]
+fn rejected_revision_is_retried_when_configured_source_changes() {
+    let codex_home = TempDir::new().unwrap();
+    let install_root = marketplace_install_root(codex_home.path());
+    let marketplace = ConfiguredGitMarketplace {
+        name: "good".to_string(),
+        source: "https://example.com/good.git".to_string(),
+        ref_name: None,
+        sparse_paths: Vec::new(),
+    };
+    super::rejection::record_rejected_revision(&install_root, &marketplace, "abc", "bad manifest");
+    assert_eq!(
+        super::rejection::rejected_revision_reason(&install_root, &marketplace, "abc"),
+        Some("bad manifest".to_string())
+    );
+    assert_eq!(
+        super::rejection::rejected_revision_reason(&install_root, &marketplace, "def"),
+        None
+    );
+    let moved = ConfiguredGitMarketplace {
+        ref_name: Some("release".to_string()),
+        ..marketplace.clone()
+    };
+    assert_eq!(
+        super::rejection::rejected_revision_reason(&install_root, &moved, "abc"),
+        None
+    );
+    super::rejection::clear_rejected_revision(&install_root, "good");
+    assert_eq!(
+        super::rejection::rejected_revision_reason(&install_root, &marketplace, "abc"),
+        None
+    );
+}
+
+fn init_marketplace_manifest(repo: &Path, marketplace_name: &str) {
+    let manifest_dir = repo.join(".agents/plugins");
+    std::fs::create_dir_all(&manifest_dir).expect("create marketplace manifest directory");
+    std::fs::write(
+        manifest_dir.join("marketplace.json"),
+        format!(r#"{{"name":"{marketplace_name}","plugins":[]}}"#),
+    )
+    .expect("write marketplace manifest");
+}
+
+#[test]
+fn transient_manifest_read_failure_does_not_block_same_revision_recovery() {
+    let home = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    init_marketplace_repo(remote.path(), "good");
+    let source = url::Url::from_directory_path(remote.path())
+        .unwrap()
+        .to_string();
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(remote.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let revision = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let marketplace = ConfiguredGitMarketplace {
+        name: "good".into(),
+        source: source.clone(),
+        ref_name: None,
+        sparse_paths: Vec::new(),
+    };
+    let install_root = marketplace_install_root(home.path());
+    // Inject the transient error at the production validation-result boundary.
+    let error = crate::marketplace::MarketplaceError::Io {
+        context: "failed to read marketplace file",
+        source: std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "temporary read failure",
+        ),
+    };
+    super::rejection::record_validation_rejection(
+        &install_root,
+        &marketplace,
+        &revision,
+        &revision,
+        remote.path(),
+        &error,
+    );
+    let system = format!("[marketplaces.good]\nsource_type = \"git\"\nsource = {source:?}\n");
+    let stack = system_marketplace_stack(home.path(), &system, "");
+    let recovered = upgrade_configured_git_marketplaces_with_mode(
+        home.path(),
+        &stack,
+        Some("good"),
+        PluginGitMode::Automatic,
+        &config_reloader(home.path()),
+    );
+    assert!(recovered.errors.is_empty());
+    assert_eq!(
+        recovered.upgraded_roots.len(),
+        1,
+        "same valid revision must be retried"
+    );
+}
