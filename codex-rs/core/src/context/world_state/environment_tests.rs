@@ -414,3 +414,75 @@ fn failure_context_limits_total_detail_bytes_at_utf8_boundaries() {
         ]
     );
 }
+
+#[test]
+fn parse_powershell_version_keeps_major_minor() {
+    assert_eq!(
+        parse_powershell_version(b"5.1.26100.4768\r\n"),
+        Some("5.1".to_string())
+    );
+    assert_eq!(parse_powershell_version(b"7.5.2"), Some("7.5".to_string()));
+    assert_eq!(parse_powershell_version(b"garbage"), None);
+    assert_eq!(parse_powershell_version(b"7"), None);
+}
+
+#[tokio::test]
+async fn powershell_version_cache_shares_one_in_flight_probe() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    let cache = Arc::new(PowerShellVersionCache::default());
+    let probes = Arc::new(AtomicUsize::new(0));
+    let (release_probe, probe_released) = tokio::sync::oneshot::channel::<()>();
+    let path = PathBuf::from("pwsh-under-test");
+
+    // Simulates the session-start prewarm: its probe is still running when
+    // the first turn asks for the version.
+    let prewarm = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        let probes = Arc::clone(&probes);
+        let path = path.clone();
+        async move {
+            cache
+                .get_or_probe(&path, || async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    let _ = probe_released.await;
+                    Some("7.5".to_string())
+                })
+                .await
+        }
+    });
+    while probes.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let turn = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        let probes = Arc::clone(&probes);
+        let path = path.clone();
+        async move {
+            cache
+                .get_or_probe(&path, || async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    Some("unexpected".to_string())
+                })
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    let _ = release_probe.send(());
+
+    assert_eq!(prewarm.await.expect("prewarm"), Some("7.5".to_string()));
+    assert_eq!(turn.await.expect("turn"), Some("7.5".to_string()));
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+    // A failed probe is cached too, matching the previous behavior.
+    let failed = PathBuf::from("missing-shell");
+    assert_eq!(cache.get_or_probe(&failed, || async { None }).await, None);
+    assert_eq!(
+        cache
+            .get_or_probe(&failed, || async { Some("late".to_string()) })
+            .await,
+        None
+    );
+}

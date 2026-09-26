@@ -41,6 +41,7 @@ pub(crate) use collaboration_mode::CollaborationModeState;
 pub(crate) use compact_permissions::CompactPermissionsState;
 pub(crate) use context_window_guidance::ContextWindowGuidanceState;
 pub(crate) use environment::EnvironmentsState;
+pub(crate) use environment::prewarm_powershell_version;
 pub(crate) use environments_instructions::EnvironmentsInstructionsState;
 pub(crate) use managed_developer_instructions::ManagedDeveloperInstructions;
 pub(crate) use managed_developer_instructions::ManagedDeveloperInstructionsState;

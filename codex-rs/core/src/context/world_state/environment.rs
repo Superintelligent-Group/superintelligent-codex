@@ -14,16 +14,47 @@ use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 
-static POWERSHELL_VERSIONS: LazyLock<Mutex<BTreeMap<PathBuf, Option<String>>>> =
-    LazyLock::new(Mutex::default);
+static POWERSHELL_VERSIONS: LazyLock<PowerShellVersionCache> =
+    LazyLock::new(PowerShellVersionCache::default);
+
+/// Per-shell-path cache of the probed PowerShell version.
+///
+/// Each path owns a `OnceCell`, so concurrent callers (the session-start
+/// prewarm and the first turn's world-state build) share a single in-flight
+/// probe instead of each spawning `powershell.exe`. The outer std mutex only
+/// guards the map lookup and is never held across an `.await`.
+#[derive(Default)]
+struct PowerShellVersionCache {
+    cells: std::sync::Mutex<BTreeMap<PathBuf, Arc<OnceCell<Option<String>>>>>,
+}
+
+impl PowerShellVersionCache {
+    fn cell(&self, shell_path: &Path) -> Arc<OnceCell<Option<String>>> {
+        let mut cells = self
+            .cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(cells.entry(shell_path.to_owned()).or_default())
+    }
+
+    async fn get_or_probe<F, Fut>(&self, shell_path: &Path, probe: F) -> Option<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<String>>,
+    {
+        self.cell(shell_path).get_or_init(probe).await.clone()
+    }
+}
 
 /// Environment values visible to the model.
 #[derive(Clone, Debug, Default)]
@@ -416,14 +447,26 @@ enum EnvironmentStatus {
     Failed,
 }
 
-async fn powershell_version(shell_path: &Path) -> Option<String> {
-    if let Some(version) = {
-        let versions = POWERSHELL_VERSIONS.lock().await;
-        versions.get(shell_path).cloned()
-    } {
-        return version;
-    }
+/// Starts probing the PowerShell version for `shell_path` in the background so
+/// the first turn's world-state build does not block on spawning
+/// `powershell.exe`. The result lands in the same cache the turn reads, so the
+/// rendered world state is identical to probing inline.
+pub(crate) fn prewarm_powershell_version(shell_path: PathBuf) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let _ = powershell_version(&shell_path).await;
+    });
+}
 
+async fn powershell_version(shell_path: &Path) -> Option<String> {
+    POWERSHELL_VERSIONS
+        .get_or_probe(shell_path, || probe_powershell_version(shell_path))
+        .await
+}
+
+async fn probe_powershell_version(shell_path: &Path) -> Option<String> {
     let mut command = Command::new(shell_path);
     command
         .args([
@@ -438,22 +481,19 @@ async fn powershell_version(shell_path: &Path) -> Option<String> {
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
-    let version = tokio::time::timeout(Duration::from_secs(2), command.output())
+    tokio::time::timeout(Duration::from_secs(2), command.output())
         .await
         .ok()
         .and_then(Result::ok)
         .filter(|output| output.status.success() && output.stdout.len() <= 64)
-        .and_then(|output| {
-            let mut components = std::str::from_utf8(&output.stdout).ok()?.trim().split('.');
-            let major = components.next()?.parse::<u16>().ok()?;
-            let minor = components.next()?.parse::<u16>().ok()?;
-            Some(format!("{major}.{minor}"))
-        });
-    POWERSHELL_VERSIONS
-        .lock()
-        .await
-        .insert(shell_path.to_owned(), version.clone());
-    version
+        .and_then(|output| parse_powershell_version(&output.stdout))
+}
+
+fn parse_powershell_version(stdout: &[u8]) -> Option<String> {
+    let mut components = std::str::from_utf8(stdout).ok()?.trim().split('.');
+    let major = components.next()?.parse::<u16>().ok()?;
+    let minor = components.next()?.parse::<u16>().ok()?;
+    Some(format!("{major}.{minor}"))
 }
 
 fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, EnvironmentState> {
