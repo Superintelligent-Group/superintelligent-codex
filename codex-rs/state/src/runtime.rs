@@ -137,67 +137,41 @@ impl StateRuntime {
         let memories_path = sqlite.memories_db_path();
         let queue_path = sqlite.queue_db_path();
         let has_memories_v2 = tokio::fs::try_exists(sqlite.memories_v2_db_path()).await?;
-        let pool = match sqlite
-            .open_state_db(&state_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open state db at {}: {err}", state_path.display());
-                return Err(err);
-            }
-        };
-        let logs_pool = match sqlite
-            .open_logs_db(&logs_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open logs db at {}: {err}", logs_path.display());
-                close_sqlite_pools(&[pool.as_ref()]).await;
-                return Err(err);
-            }
-        };
-        let goals_pool = match sqlite
-            .open_goals_db(&goals_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open goals db at {}: {err}", goals_path.display());
-                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
-                return Err(err);
-            }
-        };
-        let memories_pool = match sqlite
-            .open_memories_db(&memories_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!(
-                    "failed to open memories db at {}: {err}",
-                    memories_path.display()
-                );
-                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
-                return Err(err);
-            }
-        };
-        let queue_pool = match sqlite
-            .open_queue_db(&queue_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open queue db at {}: {err}", queue_path.display());
-                close_sqlite_pools(&[
-                    pool.as_ref(),
-                    logs_pool.as_ref(),
-                    goals_pool.as_ref(),
-                    memories_pool.as_ref(),
+        // The runtime DBs are independent files with their own migrators, so
+        // open and migrate them concurrently. On failure, report the first
+        // error in the historical open order (state, logs, goals, memories,
+        // queue) so corruption recovery targets the same DB as before, and
+        // close every pool that did open.
+        let (state_result, logs_result, goals_result, memories_result, queue_result) = tokio::join!(
+            sqlite.open_state_db(&state_migrator, telemetry_override),
+            sqlite.open_logs_db(&logs_migrator, telemetry_override),
+            sqlite.open_goals_db(&goals_migrator, telemetry_override),
+            sqlite.open_memories_db(&memories_migrator, telemetry_override),
+            sqlite.open_queue_db(&queue_migrator, telemetry_override),
+        );
+        let (pool, logs_pool, goals_pool, memories_pool, queue_pool) = match (
+            state_result,
+            logs_result,
+            goals_result,
+            memories_result,
+            queue_result,
+        ) {
+            (Ok(state), Ok(logs), Ok(goals), Ok(memories), Ok(queue)) => (
+                Arc::new(state),
+                Arc::new(logs),
+                Arc::new(goals),
+                Arc::new(memories),
+                Arc::new(queue),
+            ),
+            (state, logs, goals, memories, queue) => {
+                return Err(first_runtime_db_error([
+                    ("state", state_path.as_path(), state),
+                    ("logs", logs_path.as_path(), logs),
+                    ("goals", goals_path.as_path(), goals),
+                    ("memories", memories_path.as_path(), memories),
+                    ("queue", queue_path.as_path(), queue),
                 ])
-                .await;
-                return Err(err);
+                .await);
             }
         };
         let started = Instant::now();
@@ -344,6 +318,26 @@ impl StateRuntime {
         }
         Ok(cleared)
     }
+}
+
+/// Logs every failed runtime DB open, closes the pools that opened, and
+/// returns the first error in the given order.
+async fn first_runtime_db_error(
+    results: [(&str, &Path, anyhow::Result<SqlitePool>); 5],
+) -> anyhow::Error {
+    let mut opened = Vec::new();
+    let mut first_err = None;
+    for (label, path, result) in results {
+        match result {
+            Ok(pool) => opened.push(pool),
+            Err(err) => {
+                warn!("failed to open {label} db at {}: {err}", path.display());
+                first_err.get_or_insert(err);
+            }
+        }
+    }
+    close_sqlite_pools(&opened.iter().collect::<Vec<_>>()).await;
+    first_err.unwrap_or_else(|| anyhow::anyhow!("runtime db initialization failed"))
 }
 
 async fn close_sqlite_pools(pools: &[&SqlitePool]) {
@@ -710,6 +704,41 @@ mod tests {
         .collect::<BTreeSet<_>>();
         assert_eq!(phases, expected);
 
+        runtime.close().await;
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn init_reports_first_failing_runtime_db_in_open_order() {
+        let codex_home = unique_temp_dir();
+        let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        tokio::fs::create_dir_all(sqlite.home())
+            .await
+            .expect("create sqlite home");
+        // A directory where a DB file should be makes that DB fail to open.
+        for path in [sqlite.queue_db_path(), sqlite.logs_db_path()] {
+            tokio::fs::create_dir_all(&path)
+                .await
+                .expect("block db path");
+        }
+
+        let Err(err) = StateRuntime::init(sqlite.clone(), "test-provider".to_string()).await else {
+            panic!("blocked logs and queue DBs should fail init");
+        };
+        let message = err.to_string();
+        assert!(message.contains("log DB"), "unexpected error: {message}");
+        assert!(!message.contains("queue DB"), "unexpected error: {message}");
+
+        // Once the blocking paths are gone, the pools closed on failure do not
+        // leave anything behind that prevents a clean retry.
+        for path in [sqlite.queue_db_path(), sqlite.logs_db_path()] {
+            tokio::fs::remove_dir_all(&path)
+                .await
+                .expect("unblock db path");
+        }
+        let runtime = StateRuntime::init(sqlite, "test-provider".to_string())
+            .await
+            .expect("state runtime should initialize after unblocking");
         runtime.close().await;
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
