@@ -35,3 +35,6 @@ pub use responses_websocket_probe::ResponsesWebsocketProbe;
 pub use responses_websocket_probe::ResponsesWebsocketProbeError;
 pub use responses_websocket_probe::ResponsesWebsocketProbeFailureStage;
 pub use search::SearchClient;
+
+pub use responses_websocket::WEBSOCKET_SERVER_CLOSE_MESSAGE;
+pub use responses_websocket::is_websocket_server_close;
