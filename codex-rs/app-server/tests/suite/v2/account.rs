@@ -1304,6 +1304,54 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn login_account_api_key_keeps_persisted_chatgpt_login() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            ..Default::default()
+        },
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("access-chatgpt")
+            .account_id("account-123")
+            .email("user@example.com")
+            .plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let auth_path = codex_home.path().join("auth.json");
+    let persisted_before = std::fs::read_to_string(&auth_path)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let req_id = mcp
+        .send_login_account_api_key_request("sk-test-key")
+        .await?;
+    let login: LoginAccountResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(req_id)).await??;
+    assert_eq!(login, LoginAccountResponse::ApiKey {});
+
+    // This app-server session uses the API key...
+    let received = read_account(&mut mcp).await?;
+    assert_eq!(received.account, Some(Account::ApiKey {}));
+
+    // ...but the ChatGPT login shared with other Codex processes is untouched.
+    assert_eq!(std::fs::read_to_string(&auth_path)?, persisted_before);
+    let logout_id = mcp.send_logout_account_request().await?;
+    let _: LogoutAccountResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(logout_id)).await??;
+    assert_eq!(std::fs::read_to_string(&auth_path)?, persisted_before);
+    Ok(())
+}
+
 #[test_case("amazonBedrock"; "api_key")]
 #[test_case("amazonBedrockAccessKeys"; "access_keys")]
 #[tokio::test]
@@ -2276,8 +2324,12 @@ async fn login_account_chatgpt_device_code_returns_error_when_disabled() -> Resu
     Ok(())
 }
 
+#[test_case(false; "fresh_login")]
+#[test_case(true; "replaces_ephemeral_api_key")]
 #[tokio::test]
-async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()> {
+async fn login_account_chatgpt_device_code_succeeds_and_notifies(
+    replaces_ephemeral_api_key: bool,
+) -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
     create_config_toml(
@@ -2289,6 +2341,16 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
         },
     )?;
     write_models_cache(codex_home.path()).await?;
+    if replaces_ephemeral_api_key {
+        write_chatgpt_auth(
+            codex_home.path(),
+            ChatGptAuthFixture::new("previous-access-token")
+                .account_id("previous-account")
+                .email("previous@example.com")
+                .plan_type("pro"),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
     let collector = super::auth_storage_originator::configure_collector(codex_home.path()).await?;
 
     mock_device_code_usercode(&mock_server, /*interval_seconds*/ 0).await;
@@ -2319,6 +2381,49 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
         version: "1".into(),
     })
     .await?;
+
+    if replaces_ephemeral_api_key {
+        let request_id = mcp
+            .send_login_account_api_key_request("sk-test-key")
+            .await?;
+        let _: LoginAccountResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+        // Consume this login's completion before waiting for the device-code login.
+        let note = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("account/login/completed"),
+        )
+        .await??;
+        let parsed: ServerNotification = note.try_into()?;
+        let ServerNotification::AccountLoginCompleted(payload) = parsed else {
+            bail!("unexpected notification: {parsed:?}");
+        };
+        assert_eq!(payload.login_id, None);
+        assert_eq!(payload.success, true);
+        assert_eq!(payload.error, None);
+        // A startup ChatGPT update may already be buffered. Drain through the API-key
+        // update so it cannot be mistaken for the later device-code account update.
+        timeout(DEFAULT_READ_TIMEOUT, async {
+            loop {
+                let note = mcp
+                    .read_stream_until_notification_message("account/updated")
+                    .await?;
+                let parsed: ServerNotification = note.try_into()?;
+                let ServerNotification::AccountUpdated(payload) = parsed else {
+                    bail!("unexpected notification: {parsed:?}");
+                };
+                if payload.auth_mode == Some(AuthMode::ApiKey) {
+                    assert_eq!(payload.plan_type, None);
+                    break Ok::<(), anyhow::Error>(());
+                }
+            }
+        })
+        .await??;
+        assert_eq!(
+            read_account(&mut mcp).await?.account,
+            Some(Account::ApiKey {})
+        );
+    }
 
     let request_id = mcp.send_login_account_chatgpt_device_code_request().await?;
     let login: LoginAccountResponse =
@@ -2358,11 +2463,20 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
     };
     assert_eq!(payload.auth_mode, Some(AuthMode::Chatgpt));
     assert_eq!(payload.plan_type, Some(AccountPlanType::Pro));
+    if replaces_ephemeral_api_key {
+        assert!(matches!(
+            read_account(&mut mcp).await?.account,
+            Some(Account::Chatgpt { .. })
+        ));
+    }
     assert!(
         codex_home.path().join("auth.json").exists(),
         "auth.json should be created when device code login succeeds"
     );
-    super::auth_storage_originator::assert_saved_originators(&collector, &["codex_vscode"]).await?;
+    if !replaces_ephemeral_api_key {
+        super::auth_storage_originator::assert_saved_originators(&collector, &["codex_vscode"])
+            .await?;
+    }
     Ok(())
 }
 
