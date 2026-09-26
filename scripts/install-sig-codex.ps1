@@ -14,6 +14,8 @@
 #>
 param(
   [string]$CodexRepo = 'C:\Github\superintelligent-codex',
+  # Dedicated build dir; worktrees must not share one (stale outputs).
+  [string]$TargetDir = 'C:\cargo-target\sig-codex-release',
   [switch]$SkipBuild,
   [switch]$Restore
 )
@@ -52,7 +54,8 @@ if ($Restore) {
     $branch = git rev-parse --abbrev-ref HEAD
     if ($branch -ne $stack.branch) { throw "$CodexRepo is on '$branch', expected '$($stack.branch)'" }
     if (git status --porcelain --untracked-files=no) { throw "$CodexRepo has uncommitted changes" }
-    $built = Join-Path $CodexRepo 'codex-rs\target\release\codex.exe'
+    $env:CARGO_TARGET_DIR = $TargetDir
+    $built = Join-Path $TargetDir 'release\codex.exe'
     if (-not $SkipBuild) {
       # Git for Windows ships a coreutils link.exe that shadows the MSVC linker.
       $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'Git\\usr\\bin' }) -join ';'

@@ -90,6 +90,20 @@
       "upstream": null,
       "reason": "Five runtime SQLite DBs opened and migrated sequentially at startup.",
       "drop_when": "Upstream opens them concurrently."
+    },
+    {
+      "subject": "fix(websocket): classify server closes and scope HTTP fallback to the turn",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "A server close after a 101 handshake was retried blindly ~11 s (the real cause was auth), then the whole session fell back to HTTP, resending 130-170 KB of context per request (91 retries, 15 sticky fallbacks, 306 HTTP requests in one day of logs).",
+      "drop_when": "Upstream classifies websocket closes and stops making the HTTP fallback sticky for the session."
+    },
+    {
+      "subject": "perf(client): reuse pooled HTTP clients for model API requests",
+      "kind": "sig",
+      "upstream": null,
+      "reason": "A new HTTP client (native root store reload + fresh TCP/TLS) was built per model API request (~935 builds/day in logs).",
+      "drop_when": "Upstream caches the model API HTTP client."
     }
   ]
 }
