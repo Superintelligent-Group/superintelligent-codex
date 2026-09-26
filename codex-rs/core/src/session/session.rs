@@ -1355,6 +1355,15 @@ impl Session {
             } else {
                 shell::default_user_shell()
             };
+            if config.features.enabled(Feature::PowerShellShellVersion)
+                && default_shell.shell_type == shell::ShellType::PowerShell
+            {
+                // Probe off the critical path; the first turn's world state
+                // reads the same cache and only waits for any remaining time.
+                crate::context::world_state::prewarm_powershell_version(
+                    default_shell.shell_path.clone(),
+                );
+            }
             let credential_broker_available = config.features.enabled(Feature::NetworkProxy)
                 && config
                     .config_layer_stack
