@@ -6,6 +6,8 @@ codex_rust_crate(
     name = "cli",
     binaries_with_build_commit = ["codex"],
     crate_name = "codex_cli",
+    # Mirrors the Cargo `default` feature; the mimalloc dependency itself is Windows-only.
+    crate_features = ["mimalloc"],
     extra_binaries = [
         "//codex-rs/bwrap:bwrap",
     ],

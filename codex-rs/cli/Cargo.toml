@@ -19,6 +19,12 @@ name = "codex_cli"
 path = "src/lib.rs"
 doctest = false
 
+[features]
+default = ["mimalloc"]
+# Use mimalloc as the global allocator on Windows, where the system heap is
+# markedly slower for Codex's many small, short-lived allocations.
+mimalloc = ["dep:mimalloc"]
+
 [lints]
 workspace = true
 
@@ -108,6 +114,7 @@ which = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+mimalloc = { workspace = true, optional = true }
 codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
