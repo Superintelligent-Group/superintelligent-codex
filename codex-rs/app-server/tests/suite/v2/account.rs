@@ -1149,6 +1149,50 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn login_account_api_key_keeps_persisted_chatgpt_login() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            ..Default::default()
+        },
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("access-chatgpt")
+            .account_id("account-123")
+            .email("user@example.com")
+            .plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let auth_path = codex_home.path().join("auth.json");
+    let persisted_before = std::fs::read_to_string(&auth_path)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let req_id = mcp
+        .send_login_account_api_key_request("sk-test-key")
+        .await?;
+    let login: LoginAccountResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(req_id)).await??;
+    assert_eq!(login, LoginAccountResponse::ApiKey {});
+
+    // This app-server session uses the API key...
+    let received = read_account(&mut mcp).await?;
+    assert_eq!(received.account, Some(Account::ApiKey {}));
+
+    // ...but the ChatGPT login shared with other Codex processes is untouched.
+    assert_eq!(std::fs::read_to_string(&auth_path)?, persisted_before);
+    Ok(())
+}
+
 #[test_case("amazonBedrock"; "api_key")]
 #[test_case("amazonBedrockAccessKeys"; "access_keys")]
 #[tokio::test]
