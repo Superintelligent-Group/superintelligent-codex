@@ -17,9 +17,12 @@ use codex_git_utils::get_git_remote_urls_assume_git_repo;
 use codex_git_utils::get_has_changes_in_repo;
 use codex_git_utils::get_head_commit_hash;
 use codex_git_utils::git_command_spawn_count;
+use codex_git_utils::set_git_metadata_cache_enabled;
 use pretty_assertions::assert_eq;
 
 const CHILD_REPO_ENV: &str = "CODEX_GIT_SPAWN_TEST_REPO";
+/// Makes the child disable the cache through the SIG config switch instead of the env var.
+const CHILD_CONFIG_OFF_ENV: &str = "CODEX_GIT_SPAWN_TEST_CONFIG_OFF";
 
 async fn simulated_turn(repo: &Path) -> u64 {
     let before = git_command_spawn_count();
@@ -61,7 +64,7 @@ fn isolated_env(home: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
 }
 
 /// Returns the spawn counts of two consecutive turns.
-fn measure(cache_disabled: bool) -> (u64, u64) {
+fn measure(cache_disabled: bool, config_off: bool) -> (u64, u64) {
     let home = tempfile::tempdir().expect("create home");
     let repo = tempfile::tempdir().expect("create repository");
     isolated_git(
@@ -97,6 +100,11 @@ fn measure(cache_disabled: bool) -> (u64, u64) {
     } else {
         child.env_remove(DISABLE_GIT_METADATA_CACHE_ENV);
     }
+    if config_off {
+        child.env(CHILD_CONFIG_OFF_ENV, "1");
+    } else {
+        child.env_remove(CHILD_CONFIG_OFF_ENV);
+    }
     let output = child.output().expect("run child test");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "child failed: {stdout}");
@@ -115,14 +123,20 @@ fn measure(cache_disabled: bool) -> (u64, u64) {
 async fn per_turn_git_spawns() {
     if let Some(repo) = std::env::var_os(CHILD_REPO_ENV) {
         let repo = Path::new(&repo);
+        if std::env::var_os(CHILD_CONFIG_OFF_ENV).is_some() {
+            set_git_metadata_cache_enabled(/*enabled*/ false);
+        }
         let first = simulated_turn(repo).await;
         let second = simulated_turn(repo).await;
         println!("GIT_SPAWNS {first} {second}");
         return;
     }
 
-    let uncached = measure(/*cache_disabled*/ true);
-    let cached = measure(/*cache_disabled*/ false);
+    let uncached = measure(/*cache_disabled*/ true, /*config_off*/ false);
+    let cached = measure(/*cache_disabled*/ false, /*config_off*/ false);
+    // SIG `sig.git_metadata_cache = false` must reproduce the uncached (upstream) spawn pattern.
+    let config_off = measure(/*cache_disabled*/ false, /*config_off*/ true);
+    assert_eq!(config_off, uncached, "sig.git_metadata_cache = false");
     println!("git spawns per turn (first, steady state): uncached={uncached:?} cached={cached:?}");
 
     // Uncached: rev-parse HEAD, remote -v, fsmonitor config probe,

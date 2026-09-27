@@ -610,6 +610,45 @@ fn rejected_remote_revision_is_skipped_automatically_until_remote_moves() {
 }
 
 #[test]
+fn reject_cache_disabled_retries_rejected_revision_every_run_like_upstream() {
+    let codex_home = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    init_marketplace_repo(remote.path(), "good");
+    let source = url::Url::from_directory_path(remote.path())
+        .unwrap()
+        .to_string();
+    let system = format!("[marketplaces.good]
+source_type = \"git\"
+source = {source:?}
+");
+    let stack = system_marketplace_stack(codex_home.path(), &system, "");
+    let reload_config = config_reloader(codex_home.path());
+    let install_root = marketplace_install_root(codex_home.path());
+    let rejection = install_root.join(".upgrade-rejections/good.json");
+    let run = || {
+        upgrade_configured_git_marketplaces_with_options(
+            codex_home.path(),
+            &stack,
+            Some("good"),
+            PluginGitMode::Automatic,
+            &reload_config,
+            /*reject_cache*/ false,
+        )
+    };
+    assert_eq!(run().errors, Vec::new());
+
+    run_git(remote.path(), &["rm", "-r", "--quiet", ".agents"]);
+    std::fs::write(remote.path().join("README.md"), "no manifest").unwrap();
+    run_git(remote.path(), &["add", "."]);
+    run_git(remote.path(), &["commit", "-m", "drop manifest"]);
+
+    // Upstream: nothing is recorded, so every automatic run re-clones and re-reports.
+    assert_eq!(run().errors.len(), 1);
+    assert!(!rejection.exists());
+    assert_eq!(run().errors.len(), 1);
+}
+
+#[test]
 fn rejected_revision_is_retried_when_configured_source_changes() {
     let codex_home = TempDir::new().unwrap();
     let install_root = marketplace_install_root(codex_home.path());

@@ -930,6 +930,9 @@ pub struct Config {
     /// Memories subsystem settings.
     pub memories: MemoriesConfig,
 
+    /// SIG fork optimizations (`[sig]`); each is on by default, `false` restores upstream.
+    pub sig: codex_config::SigConfig,
+
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: AbsolutePathBuf,
@@ -1699,6 +1702,7 @@ impl Config {
             self.http_client_factory(),
             self.apps_mcp_product_sku.clone(),
         )
+        .with_marketplace_reject_cache(self.sig.marketplace_reject_cache)
     }
 
     /// Applies managed MCP requirements to servers supplied by one plugin.
@@ -3471,6 +3475,7 @@ impl Config {
         }
 
         let memories_config: MemoriesConfig = cfg.memories.clone().unwrap_or_default().into();
+        let sig_config: codex_config::SigConfig = cfg.sig.clone().unwrap_or_default().into();
         let memories_root = codex_home.join(memories_config.version.directory_name());
 
         let profiles_are_active = effective_permission_selection.profiles_are_active(
@@ -4336,9 +4341,11 @@ impl Config {
                 })
                 .transpose()?,
             memories: memories_config,
+            sig: sig_config,
             agent_interrupt_message_enabled,
             codex_home,
-            sqlite: codex_state::SqliteConfig::from_sqlite_home(sqlite_home),
+            sqlite: codex_state::SqliteConfig::from_sqlite_home(sqlite_home)
+                .with_parallel_open(sig_config.parallel_state_db_open),
             log_dir,
             config_layer_stack,
             application_network_policy: Default::default(),

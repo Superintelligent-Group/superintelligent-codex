@@ -1260,6 +1260,43 @@ async fn stale_cache_is_served_immediately_and_revalidated_in_background() {
 }
 
 #[tokio::test]
+async fn serve_stale_disabled_blocks_on_fetch_like_upstream() {
+    let initial_models = vec![remote_model("stale", "Stale", /*priority*/ 1)];
+    let codex_home = tempdir().expect("temp dir");
+    let updated_models = vec![remote_model("fresh", "Fresh", /*priority*/ 9)];
+    let endpoint = TestModelsEndpoint::new(vec![initial_models.clone(), updated_models.clone()]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    manager
+        .refresh_available_models(
+            RefreshStrategy::OnlineIfUncached,
+            &DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("initial refresh succeeds");
+    mutate_file_cache_for_test(codex_home.path(), |cache| {
+        cache.fetched_at = Utc::now() - chrono::Duration::days(30);
+    })
+    .await;
+
+    // sig.models_serve_stale = false: a stale cache is a miss and the fetch blocks the caller.
+    let restarted = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    restarted.set_serve_stale_enabled(/*enabled*/ false);
+    restarted
+        .refresh_available_models(
+            RefreshStrategy::OnlineIfUncached,
+            &DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("blocking refresh succeeds");
+    assert_eq!(
+        endpoint.fetch_count(),
+        2,
+        "the fetch must complete before the call returns"
+    );
+    assert_models_contain(&restarted.get_remote_models().await, &updated_models);
+}
+
+#[tokio::test]
 async fn repeated_stale_reads_share_one_background_refresh() {
     let initial_models = vec![remote_model("stale", "Stale", /*priority*/ 1)];
     let codex_home = tempdir().expect("temp dir");

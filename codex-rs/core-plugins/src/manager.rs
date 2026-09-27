@@ -59,7 +59,7 @@ use crate::marketplace_policy::configured_plugins_from_stack;
 use crate::marketplace_upgrade::ConfigLayerReload;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeError;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeOutcome;
-use crate::marketplace_upgrade::upgrade_configured_git_marketplaces_with_mode;
+use crate::marketplace_upgrade::upgrade_configured_git_marketplaces_with_options;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::remote::RecommendedPluginsMode;
 use crate::remote::RemoteInstalledPlugin;
@@ -159,6 +159,8 @@ pub struct PluginsConfigInput {
     pub chatgpt_base_url: String,
     pub product_sku: Option<String>,
     http_client_factory: HttpClientFactory,
+    /// SIG `sig.marketplace_reject_cache`; defaults to on.
+    marketplace_reject_cache: bool,
 }
 
 impl PluginsConfigInput {
@@ -179,7 +181,15 @@ impl PluginsConfigInput {
             chatgpt_base_url,
             http_client_factory,
             product_sku,
+            marketplace_reject_cache: true,
         }
+    }
+
+    /// Sets SIG `sig.marketplace_reject_cache`. Off restores upstream: every automatic upgrade
+    /// re-clones a revision that already failed validation.
+    pub fn with_marketplace_reject_cache(mut self, enabled: bool) -> Self {
+        self.marketplace_reject_cache = enabled;
+        self
     }
 
     /// Builds route-aware service state for remote plugin requests.
@@ -2919,12 +2929,13 @@ impl PluginsManager {
         mode: PluginGitMode,
         reload_config: &ConfigLayerReload,
     ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
-        let mut outcome = upgrade_configured_git_marketplaces_with_mode(
+        let mut outcome = upgrade_configured_git_marketplaces_with_options(
             self.codex_home.as_path(),
             &config.config_layer_stack,
             marketplace_name,
             mode,
             reload_config,
+            config.marketplace_reject_cache,
         );
         if let Some(marketplace_name) = marketplace_name
             && outcome.selected_marketplaces.is_empty()

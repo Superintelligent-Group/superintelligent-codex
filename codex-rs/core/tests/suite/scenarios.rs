@@ -101,6 +101,7 @@ fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         cloud_skill_enabled: config.cloud_skill_enabled,
+        shadow_selection_offpath: true,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
     });
     Arc::new(extensions.build())
@@ -605,6 +606,7 @@ async fn astra_omits_disabled_executor_skills_from_model_context() -> Result<()>
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );

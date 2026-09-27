@@ -117,6 +117,11 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Static catalogs ignore this setting.
     fn set_api_key_model_discovery_enabled(&self, _enabled: bool) {}
 
+    /// SIG `sig.models_serve_stale`: when enabled (the default), a stale cached catalog is served
+    /// immediately while a background refresh runs. When disabled, a stale cache forces a blocking
+    /// fetch exactly as upstream does. Static catalogs ignore this setting.
+    fn set_serve_stale_enabled(&self, _enabled: bool) {}
+
     /// List all available models, refreshing according to the specified strategy.
     ///
     /// Returns model presets sorted by priority and filtered by auth mode and visibility.
@@ -273,6 +278,8 @@ struct OpenAiModelsManagerInner {
     auth_manager: Option<Arc<AuthManager>>,
     /// Set while a background refresh started from a stale cache hit is running.
     background_refresh_in_flight: AtomicBool,
+    /// SIG `sig.models_serve_stale`; defaults to on.
+    serve_stale_enabled: AtomicBool,
 }
 
 /// Clears the in-flight flag even if the background refresh panics or is cancelled.
@@ -351,6 +358,7 @@ impl OpenAiModelsManager {
                 endpoint_client,
                 auth_manager,
                 background_refresh_in_flight: AtomicBool::new(false),
+                serve_stale_enabled: AtomicBool::new(true),
             }),
         }
     }
@@ -367,6 +375,12 @@ impl StaticModelsManager {
 }
 
 impl ModelsManager for OpenAiModelsManager {
+    fn set_serve_stale_enabled(&self, enabled: bool) {
+        self.inner
+            .serve_stale_enabled
+            .store(enabled, Ordering::SeqCst);
+    }
+
     fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
         self.inner
             .api_key_model_discovery_enabled
@@ -541,7 +555,8 @@ impl OpenAiModelsManager {
                 }
                 // Stale-while-revalidate: serve any cached catalog for this client version and
                 // identity immediately, and refresh it without blocking the caller.
-                if self.inner.try_load_stale_cache().await
+                if self.inner.serve_stale_enabled.load(Ordering::SeqCst)
+                    && self.inner.try_load_stale_cache().await
                     && self.spawn_background_refresh(http_client_factory)
                 {
                     return Ok(());

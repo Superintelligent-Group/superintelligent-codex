@@ -88,22 +88,45 @@ pub fn upgrade_configured_git_marketplaces(
     marketplace_name: Option<&str>,
     reload_config: &ConfigLayerReload,
 ) -> ConfiguredMarketplaceUpgradeOutcome {
-    upgrade_configured_git_marketplaces_with_mode(
+    upgrade_configured_git_marketplaces_with_options(
         codex_home,
         config_layer_stack,
         marketplace_name,
         PluginGitMode::Manual,
         reload_config,
+        /*reject_cache*/ true,
     )
 }
 
 /// Applies the initiating operation's Git trust policy to every selected marketplace.
+#[cfg(test)]
 pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
     codex_home: &Path,
     config_layer_stack: &ConfigLayerStack,
     marketplace_name: Option<&str>,
     mode: PluginGitMode,
     reload_config: &ConfigLayerReload,
+) -> ConfiguredMarketplaceUpgradeOutcome {
+    upgrade_configured_git_marketplaces_with_options(
+        codex_home,
+        config_layer_stack,
+        marketplace_name,
+        mode,
+        reload_config,
+        /*reject_cache*/ true,
+    )
+}
+
+/// Like [`upgrade_configured_git_marketplaces_with_mode`], with the SIG
+/// `sig.marketplace_reject_cache` switch. With `reject_cache` off, rejected revisions are neither
+/// recorded nor skipped and orphaned staging directories are left alone, as upstream does.
+pub(crate) fn upgrade_configured_git_marketplaces_with_options(
+    codex_home: &Path,
+    config_layer_stack: &ConfigLayerStack,
+    marketplace_name: Option<&str>,
+    mode: PluginGitMode,
+    reload_config: &ConfigLayerReload,
+    reject_cache: bool,
 ) -> ConfiguredMarketplaceUpgradeOutcome {
     let loaded = load_configured_git_marketplaces(config_layer_stack);
     let marketplaces = loaded
@@ -121,10 +144,12 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
     }
 
     let install_root = marketplace_install_root(codex_home);
-    remove_stale_staging_dirs(
-        &install_root.join(MARKETPLACE_UPGRADE_STAGING_DIR),
-        STALE_STAGING_DIR_MAX_AGE,
-    );
+    if reject_cache {
+        remove_stale_staging_dirs(
+            &install_root.join(MARKETPLACE_UPGRADE_STAGING_DIR),
+            STALE_STAGING_DIR_MAX_AGE,
+        );
+    }
     let mut selected_marketplaces = marketplaces
         .iter()
         .map(|marketplace| marketplace.name.clone())
@@ -149,13 +174,14 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
                     continue;
                 }
             };
-        match upgrade_configured_git_marketplace(
+        match upgrade_configured_git_marketplace_with_options(
             codex_home,
             &install_root,
             &marketplace,
             reload_config,
             normalized_source.as_ref(),
             mode,
+            reject_cache,
         ) {
             Ok(Some(upgraded_root)) => upgraded_roots.push(upgraded_root),
             Ok(None) => {}
@@ -238,6 +264,7 @@ fn parse_configured_git_marketplace(
     }))
 }
 
+#[cfg(test)]
 fn upgrade_configured_git_marketplace(
     codex_home: &Path,
     install_root: &Path,
@@ -245,6 +272,26 @@ fn upgrade_configured_git_marketplace(
     reload_config: &ConfigLayerReload,
     normalized_source: Option<&MarketplaceSource>,
     mode: PluginGitMode,
+) -> Result<Option<AbsolutePathBuf>, String> {
+    upgrade_configured_git_marketplace_with_options(
+        codex_home,
+        install_root,
+        marketplace,
+        reload_config,
+        normalized_source,
+        mode,
+        /*reject_cache*/ true,
+    )
+}
+
+fn upgrade_configured_git_marketplace_with_options(
+    codex_home: &Path,
+    install_root: &Path,
+    marketplace: &ConfiguredGitMarketplace,
+    reload_config: &ConfigLayerReload,
+    normalized_source: Option<&MarketplaceSource>,
+    mode: PluginGitMode,
+    reject_cache: bool,
 ) -> Result<Option<AbsolutePathBuf>, String> {
     validate_plugin_segment(&marketplace.name, "marketplace name")?;
     let (source, ref_name) = match normalized_source {
@@ -271,7 +318,8 @@ fn upgrade_configured_git_marketplace(
     }
     // Automatic runs skip a remote revision that already failed validation; a manual upgrade
     // always retries so users can force it.
-    if mode == PluginGitMode::Automatic
+    if reject_cache
+        && mode == PluginGitMode::Automatic
         && let Some(reason) = rejected_revision_reason(install_root, marketplace, &remote_revision)
     {
         debug!(
@@ -322,14 +370,18 @@ fn upgrade_configured_git_marketplace(
         Ok(_) => None,
     };
     if let Some(reason) = rejection {
-        record_rejected_revision(install_root, marketplace, &remote_revision, &reason);
+        if reject_cache {
+            record_rejected_revision(install_root, marketplace, &remote_revision, &reason);
+        }
         return Err(reason);
     }
     write_installed_marketplace_metadata(staged_dir.path(), marketplace, &activated_revision)?;
     activate_marketplace_root(&destination, staged_dir, &previous_snapshot, || {
         ensure_configured_git_marketplace_unchanged(reload_config, marketplace)
     })?;
-    clear_rejected_revision(install_root, &marketplace.name);
+    if reject_cache {
+        clear_rejected_revision(install_root, &marketplace.name);
+    }
 
     AbsolutePathBuf::try_from(destination)
         .map(Some)

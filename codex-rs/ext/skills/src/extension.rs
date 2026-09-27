@@ -406,9 +406,7 @@ where
                     collect_explicit_skill_mentions(&input.user_input, &shadow_catalog);
                 // Telemetry-only: evaluate off the critical path. The skills
                 // injected below come solely from `selected_entries`.
-                let pending = self.shadow_selection.spawn(
-                    thread_state.shadow_selection_tail(),
-                    ShadowSelectionRequest {
+                let request = ShadowSelectionRequest {
                         turn_id: input.turn_id.clone(),
                         user_input: input.user_input.clone(),
                         catalog: shadow_catalog,
@@ -418,8 +416,14 @@ where
                             &thread_state.recent_skill_invocations,
                         ),
                         task_context: Arc::clone(&thread_state.shadow_task_context),
-                    },
-                );
+                };
+                // SIG `sig.skills_shadow_offpath = false` evaluates inline, as upstream does.
+                let pending = if config.shadow_selection_offpath {
+                    self.shadow_selection
+                        .spawn(thread_state.shadow_selection_tail(), request)
+                } else {
+                    self.shadow_selection.run_inline(request)
+                };
                 thread_state.set_shadow_selection_tail(pending.clone());
                 Some(pending)
             } else {

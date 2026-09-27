@@ -37,6 +37,7 @@ mod requirements_exec_policy;
 mod requirements_layers;
 pub mod schema;
 mod shell_environment_policy;
+pub mod sig;
 mod skills_config;
 mod state;
 mod strict_config;
@@ -46,6 +47,9 @@ mod tui_effects;
 mod tui_keymap;
 mod tui_rendering;
 pub mod types;
+
+pub use sig::SigConfig;
+pub use sig::SigToml;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 

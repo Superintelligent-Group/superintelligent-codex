@@ -122,11 +122,27 @@ pub struct RuntimeDbPath {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqliteConfig {
     sqlite_home: AbsolutePathBuf,
+    /// SIG `sig.parallel_state_db_open`; defaults to on.
+    parallel_open: bool,
 }
 
 impl SqliteConfig {
     pub fn from_sqlite_home(sqlite_home: AbsolutePathBuf) -> Self {
-        Self { sqlite_home }
+        Self {
+            sqlite_home,
+            parallel_open: true,
+        }
+    }
+
+    /// Sets SIG `sig.parallel_state_db_open`. Off restores upstream: the runtime DBs are opened
+    /// and migrated one after another.
+    pub fn with_parallel_open(mut self, parallel_open: bool) -> Self {
+        self.parallel_open = parallel_open;
+        self
+    }
+
+    pub fn parallel_open(&self) -> bool {
+        self.parallel_open
     }
 
     pub fn new_for_testing(sqlite_home: AbsolutePathBuf) -> Self {

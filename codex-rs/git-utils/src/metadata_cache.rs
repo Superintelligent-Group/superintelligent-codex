@@ -28,7 +28,10 @@
 //! so every entry also expires after [`MAX_ENTRY_AGE`].
 //!
 //! Failed Git invocations are never cached. Set
-//! `CODEX_DISABLE_GIT_METADATA_CACHE` to any value to bypass the cache.
+//! `CODEX_DISABLE_GIT_METADATA_CACHE` to any value to bypass the cache, or
+//! call [`set_git_metadata_cache_enabled`] with `false` (SIG
+//! `sig.git_metadata_cache = false`), which restores upstream behavior: every
+//! lookup runs Git.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -269,8 +272,26 @@ fn is_cached(cwd: &Path, kind: MetadataKind) -> bool {
         })
 }
 
+/// Process-wide SIG `sig.git_metadata_cache` switch; defaults to on.
+static GIT_METADATA_CACHE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Enables or disables the git metadata cache for this process (SIG `sig.git_metadata_cache`).
+///
+/// The cache is process-global, so the switch is too; the most recent session configuration
+/// wins. Disabling it does not drop stored entries, it only bypasses them.
+pub fn set_git_metadata_cache_enabled(enabled: bool) {
+    GIT_METADATA_CACHE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the git metadata cache is enabled by configuration (ignores the env kill switch).
+pub fn git_metadata_cache_enabled() -> bool {
+    GIT_METADATA_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn cache_bypassed_by_env() -> bool {
-    BYPASS_ENV_VARS
+    !git_metadata_cache_enabled()
+        || BYPASS_ENV_VARS
         .iter()
         .any(|name| std::env::var_os(name).is_some())
 }

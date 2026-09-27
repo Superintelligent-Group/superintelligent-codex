@@ -433,6 +433,7 @@ pub fn build_models_manager(
     manager.set_api_key_model_discovery_enabled(
         config.features.enabled(Feature::ApiKeyModelDiscovery),
     );
+    manager.set_serve_stale_enabled(config.sig.models_serve_stale);
     manager
 }
 

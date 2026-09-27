@@ -3934,6 +3934,57 @@
       },
       "type": "object"
     },
+    "SigToml": {
+      "additionalProperties": false,
+      "description": "Raw `[sig]` table as written in `config.toml`.",
+      "properties": {
+        "git_metadata_cache": {
+          "description": "Cache per-turn git metadata keyed on repository file fingerprints.",
+          "type": "boolean"
+        },
+        "http_client_pool": {
+          "description": "Reuse pooled HTTP clients for model API requests.",
+          "type": "boolean"
+        },
+        "marketplace_reject_cache": {
+          "description": "Skip re-cloning marketplace revisions that already failed validation.",
+          "type": "boolean"
+        },
+        "mcp_nonblocking_first_turn": {
+          "description": "Let the first turn proceed without waiting for optional MCP servers.",
+          "type": "boolean"
+        },
+        "models_serve_stale": {
+          "description": "Serve a stale on-disk model catalog while refreshing it in the background.",
+          "type": "boolean"
+        },
+        "parallel_state_db_open": {
+          "description": "Open and migrate the runtime SQLite databases concurrently.",
+          "type": "boolean"
+        },
+        "powershell_probe_prewarm": {
+          "description": "Probe the PowerShell version at session start instead of on the first turn.",
+          "type": "boolean"
+        },
+        "shared_prompt_cache_key": {
+          "description": "Derive the prompt cache key from the stable request prefix instead of the thread id.",
+          "type": "boolean"
+        },
+        "skills_shadow_offpath": {
+          "description": "Run shadow skill selection off the turn critical path.",
+          "type": "boolean"
+        },
+        "websocket_turn_scoped_fallback": {
+          "description": "Classify websocket server closes and scope the HTTP fallback to one turn.",
+          "type": "boolean"
+        },
+        "world_state_once": {
+          "description": "Reuse the session-start world-state snapshot for the first turn.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "SkillConfig": {
       "additionalProperties": false,
       "properties": {
@@ -7461,6 +7512,14 @@
     "show_raw_agent_reasoning": {
       "description": "When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the UI/output. Defaults to `false`.",
       "type": "boolean"
+    },
+    "sig": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/SigToml"
+        }
+      ],
+      "description": "SIG fork optimizations; each key defaults to on, `false` restores upstream behavior."
     },
     "skills": {
       "allOf": [

@@ -142,13 +142,64 @@ impl StateRuntime {
         // error in the historical open order (state, logs, goals, memories,
         // queue) so corruption recovery targets the same DB as before, and
         // close every pool that did open.
-        let (state_result, logs_result, goals_result, memories_result, queue_result) = tokio::join!(
-            sqlite.open_state_db(&state_migrator, telemetry_override),
-            sqlite.open_logs_db(&logs_migrator, telemetry_override),
-            sqlite.open_goals_db(&goals_migrator, telemetry_override),
-            sqlite.open_memories_db(&memories_migrator, telemetry_override),
-            sqlite.open_queue_db(&queue_migrator, telemetry_override),
-        );
+        //
+        // SIG `sig.parallel_state_db_open = false` restores upstream: open them
+        // one after another and stop at the first failure (later DBs are never
+        // touched), represented here as `None`.
+        let (state_result, logs_result, goals_result, memories_result, queue_result) =
+            if sqlite.parallel_open() {
+                let (state, logs, goals, memories, queue) = tokio::join!(
+                    sqlite.open_state_db(&state_migrator, telemetry_override),
+                    sqlite.open_logs_db(&logs_migrator, telemetry_override),
+                    sqlite.open_goals_db(&goals_migrator, telemetry_override),
+                    sqlite.open_memories_db(&memories_migrator, telemetry_override),
+                    sqlite.open_queue_db(&queue_migrator, telemetry_override),
+                );
+                (
+                    Some(state),
+                    Some(logs),
+                    Some(goals),
+                    Some(memories),
+                    Some(queue),
+                )
+            } else {
+                let state = sqlite
+                    .open_state_db(&state_migrator, telemetry_override)
+                    .await;
+                let logs = match &state {
+                    Ok(_) => Some(
+                        sqlite
+                            .open_logs_db(&logs_migrator, telemetry_override)
+                            .await,
+                    ),
+                    Err(_) => None,
+                };
+                let goals = match &logs {
+                    Some(Ok(_)) => Some(
+                        sqlite
+                            .open_goals_db(&goals_migrator, telemetry_override)
+                            .await,
+                    ),
+                    _ => None,
+                };
+                let memories = match &goals {
+                    Some(Ok(_)) => Some(
+                        sqlite
+                            .open_memories_db(&memories_migrator, telemetry_override)
+                            .await,
+                    ),
+                    _ => None,
+                };
+                let queue = match &memories {
+                    Some(Ok(_)) => Some(
+                        sqlite
+                            .open_queue_db(&queue_migrator, telemetry_override)
+                            .await,
+                    ),
+                    _ => None,
+                };
+                (Some(state), logs, goals, memories, queue)
+            };
         let (pool, logs_pool, goals_pool, memories_pool, queue_pool) = match (
             state_result,
             logs_result,
@@ -156,7 +207,7 @@ impl StateRuntime {
             memories_result,
             queue_result,
         ) {
-            (Ok(state), Ok(logs), Ok(goals), Ok(memories), Ok(queue)) => (
+            (Some(Ok(state)), Some(Ok(logs)), Some(Ok(goals)), Some(Ok(memories)), Some(Ok(queue))) => (
                 Arc::new(state),
                 Arc::new(logs),
                 Arc::new(goals),
@@ -321,16 +372,18 @@ impl StateRuntime {
 }
 
 /// Logs every failed runtime DB open, closes the pools that opened, and
-/// returns the first error in the given order.
+/// returns the first error in the given order. `None` marks a DB that was
+/// never opened because an earlier sequential open failed.
 async fn first_runtime_db_error(
-    results: [(&str, &Path, anyhow::Result<SqlitePool>); 5],
+    results: [(&str, &Path, Option<anyhow::Result<SqlitePool>>); 5],
 ) -> anyhow::Error {
     let mut opened = Vec::new();
     let mut first_err = None;
     for (label, path, result) in results {
         match result {
-            Ok(pool) => opened.push(pool),
-            Err(err) => {
+            None => {}
+            Some(Ok(pool)) => opened.push(pool),
+            Some(Err(err)) => {
                 warn!("failed to open {label} db at {}: {err}", path.display());
                 first_err.get_or_insert(err);
             }
@@ -706,6 +759,37 @@ mod tests {
 
         runtime.close().await;
         let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn sequential_open_stops_at_first_failure_like_upstream() {
+        for parallel in [false, true] {
+            let codex_home = unique_temp_dir();
+            let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs())
+                .with_parallel_open(parallel);
+            tokio::fs::create_dir_all(sqlite.home())
+                .await
+                .expect("create sqlite home");
+            tokio::fs::create_dir_all(sqlite.logs_db_path())
+                .await
+                .expect("block logs db path");
+
+            let Err(err) = StateRuntime::init(sqlite.clone(), "test-provider".to_string()).await
+            else {
+                panic!("blocked logs DB should fail init");
+            };
+            assert!(err.to_string().contains("log DB"), "unexpected error: {err}");
+            // Upstream (sequential) never touches the DBs after the failing one; the parallel
+            // open creates them concurrently.
+            assert_eq!(
+                tokio::fs::try_exists(sqlite.goals_db_path())
+                    .await
+                    .expect("stat goals db"),
+                parallel,
+                "parallel = {parallel}"
+            );
+            let _ = tokio::fs::remove_dir_all(codex_home).await;
+        }
     }
 
     #[tokio::test]

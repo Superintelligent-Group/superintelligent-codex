@@ -2677,6 +2677,7 @@ fn skills_extension_config(config: &TestConfig) -> SkillsExtensionConfig {
         bundled_skills_enabled: config.bundled_skills_enabled,
         cloud_skill_enabled: config.cloud_skill_enabled,
         shadow_selection_enabled: config.shadow_selection_enabled,
+        shadow_selection_offpath: true,
     }
 }
 

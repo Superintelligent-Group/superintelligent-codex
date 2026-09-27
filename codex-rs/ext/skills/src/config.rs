@@ -13,4 +13,7 @@ pub struct SkillsExtensionConfig {
     pub cloud_skill_enabled: bool,
     /// Whether cheap skill selectors run in shadow mode without changing prompt contents.
     pub shadow_selection_enabled: bool,
+    /// SIG `sig.skills_shadow_offpath`: run shadow selection off the turn critical path.
+    /// `false` evaluates it inline before the turn proceeds, as upstream does.
+    pub shadow_selection_offpath: bool,
 }

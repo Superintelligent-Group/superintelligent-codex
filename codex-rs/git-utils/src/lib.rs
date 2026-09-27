@@ -52,6 +52,8 @@ pub use info::git_diff_to_remote;
 pub use info::local_git_branches;
 pub use info::recent_commits;
 pub use metadata_cache::DISABLE_GIT_METADATA_CACHE_ENV;
+pub use metadata_cache::git_metadata_cache_enabled;
+pub use metadata_cache::set_git_metadata_cache_enabled;
 pub use operations::git_config_override_env;
 pub use platform::create_symlink;
 pub use status::get_has_changes_in_repo;

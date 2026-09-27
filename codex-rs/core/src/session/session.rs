@@ -1355,7 +1355,10 @@ impl Session {
             } else {
                 shell::default_user_shell()
             };
-            if config.features.enabled(Feature::PowerShellShellVersion)
+            // The git metadata cache is process-global; the latest session config wins.
+            codex_git_utils::set_git_metadata_cache_enabled(config.sig.git_metadata_cache);
+            if config.sig.powershell_probe_prewarm
+                && config.features.enabled(Feature::PowerShellShellVersion)
                 && default_shell.shell_type == shell::ShellType::PowerShell
             {
                 // Probe off the critical path; the first turn's world state

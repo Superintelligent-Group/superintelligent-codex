@@ -484,6 +484,9 @@ pub struct ConfigToml {
     /// Memories subsystem settings.
     pub memories: Option<MemoriesToml>,
 
+    /// SIG fork optimizations; each key defaults to on, `false` restores upstream behavior.
+    pub sig: Option<crate::sig::SigToml>,
+
     /// User-level skill config entries keyed by SKILL.md path.
     pub skills: Option<SkillsConfig>,
 

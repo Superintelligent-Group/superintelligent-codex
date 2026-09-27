@@ -348,6 +348,7 @@ fn catalog_extensions(
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         }
     });
@@ -625,6 +626,7 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         cloud_skill_enabled: config.cloud_skill_enabled,
+        shadow_selection_offpath: true,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
     });
     let mut builder = test_codex()
@@ -1034,6 +1036,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -1260,6 +1263,7 @@ async fn executor_only_provider_preserves_structured_repo_skill_without_discover
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -1404,6 +1408,7 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -1706,6 +1711,7 @@ async fn explicit_executor_skill_prompt_rejects_oversized_resource() -> Result<(
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -1936,6 +1942,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: true,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -2074,6 +2081,7 @@ async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Resul
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -2512,6 +2520,7 @@ async fn production_turn_uses_provider_host_catalog_and_core_snapshot_injection(
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -2632,6 +2641,7 @@ async fn production_turn_suppresses_only_the_superseded_host_skill_prompt() -> R
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -2893,6 +2903,7 @@ async fn production_turn_keeps_cloud_world_state_incremental_across_turns() -> R
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: config.cloud_skill_enabled,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );
@@ -3156,6 +3167,7 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             cloud_skill_enabled: false,
+            shadow_selection_offpath: true,
             shadow_selection_enabled: false,
         },
     );

@@ -122,6 +122,31 @@ impl ShadowSelectionExperiment {
         async move { task.await.ok().flatten() }.boxed().shared()
     }
 
+    /// Evaluates the shadow selectors inline on the turn's critical path, as upstream does
+    /// (SIG `sig.skills_shadow_offpath = false`). The result is returned as an already-resolved
+    /// [`PendingShadowSelection`] so readers are unchanged.
+    pub(crate) fn run_inline(&self, request: ShadowSelectionRequest) -> PendingShadowSelection {
+        let ShadowSelectionRequest {
+            turn_id,
+            user_input,
+            catalog,
+            explicitly_selected,
+            host_snapshot,
+            recent_skill_invocations,
+            task_context,
+        } = request;
+        let state = Arc::new(self.run(
+            &turn_id,
+            &user_input,
+            &catalog,
+            &explicitly_selected,
+            host_snapshot.as_deref(),
+            recent_skill_invocations,
+            task_context,
+        ));
+        futures::future::ready(Some(state)).boxed().shared()
+    }
+
     pub(crate) fn run(
         &self,
         turn_id: &str,
