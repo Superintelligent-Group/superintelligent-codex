@@ -61,6 +61,14 @@ The next review found unbounded synchronous fingerprint reads of repository meta
 
 The three remaining `turn_metadata::tests` failures were rerun together, serially, on `5f7fdbdb3baf6f281be22e2859233f2f985795c3`: **3 passed, 0 failed** (8.19 s test execution; 41.75 s including Cargo). No source fix or bisect is justified by that passing reproduction. The full core lib suite is not being repeated.
 
-The stock comparison uses a new detached worktree at `C:/tmp/sig/fork-roll-0169c-stock`, tag `rust-v0.169.0` (`d32063f96c2dff1dc96af839b3952abb6acfeda4`), and the independent target directory `C:/cargo-target/stock-0.169.0`. Its initial `cargo test --locked` could not start: the tagged lockfile records workspace versions as `0.0.0`, while the manifests declare `0.169.0`. `cargo update --workspace --offline` normalized that temporary worktree's lockfile using Cargo; all **1,310 external package records are identical**. Stock source remains unchanged. The normalized, locked stock test is compiling at this checkpoint.
+The stock comparison uses a new detached worktree at `C:/tmp/sig/fork-roll-0169c-stock`, tag `rust-v0.169.0` (`d32063f96c2dff1dc96af839b3952abb6acfeda4`), and the independent target directory `C:/cargo-target/stock-0.169.0`. Its initial `cargo test --locked` could not start: the tagged lockfile records workspace versions as `0.0.0`, while the manifests declare `0.169.0`. `cargo update --workspace --offline` normalized that temporary worktree's lockfile using Cargo; all **1,310 external package records are identical**. Stock source remains unchanged. The normalized, locked stock test finished **1 passed, 2 failed** (19.23 s execution; 2351.34 s including the cold build).
+
+| Targeted metadata test | Stack `5f7fdbdb3b` | Stock `d32063f96c` |
+|---|---|---|
+| `detached_memory_responses_metadata_starts_an_independent_root_turn` | PASS | FAIL: missing `workspace path`, same assertion as continuation 1 |
+| `git_enrichment_discovers_the_repository_when_it_starts` | PASS | PASS |
+| `turn_metadata_state_preserves_subagent_parent_after_git_enrichment` | PASS | FAIL: 2 s Git enrichment timeout, same assertion as continuation 1 |
+
+Two failures therefore reproduce on stock and are upstream/environmental; the third passes on both trees. This does not establish the precise environmental cause, but provides no failing stack-only case to bisect. No upstream tests, deadlines, or production behavior were changed. The ordered gate ladder resumes at core-network.
 
 Continuation logs, exact commands, heads, durations and lockfile audit are under `C:/tmp/sig/fork-roll-0169c-gates/` (`results.jsonl`, `stock-lock-audit.json`, `stock-lock-normalization.diff`). Later gates and release remain pending. Tests use an isolated `CODEX_HOME`, no API-key environment variables, and their local mock fixtures.
