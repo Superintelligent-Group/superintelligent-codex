@@ -56,3 +56,11 @@ Continuation review corrections also clear a shadowing ephemeral API key after a
 The subsequent review identified that Bazel did not forward macro features to rust_binary. The allocator patch now forwards crate_features to the executable, so CLI mimalloc configuration reaches main.rs. Source configuration validation passed; Bazel compilation is unavailable on this host (neither bazel nor bazelisk is installed).
 
 The next review found unbounded synchronous fingerprint reads of repository metadata. The git-utils patch now rejects nonregular files and symlinks before reading, checks opened file type and size, and caps content at 1 MiB (including growth during reads). HEAD, gitdir and commondir use the same bounded path. Regressions cover oversized files and Unix FIFO/device inputs; Unix-only tests remain unexecuted on this Windows host.
+
+## Continuation 2 evidence (2026-11-15)
+
+The three remaining `turn_metadata::tests` failures were rerun together, serially, on `5f7fdbdb3baf6f281be22e2859233f2f985795c3`: **3 passed, 0 failed** (8.19 s test execution; 41.75 s including Cargo). No source fix or bisect is justified by that passing reproduction. The full core lib suite is not being repeated.
+
+The stock comparison uses a new detached worktree at `C:/tmp/sig/fork-roll-0169c-stock`, tag `rust-v0.169.0` (`d32063f96c2dff1dc96af839b3952abb6acfeda4`), and the independent target directory `C:/cargo-target/stock-0.169.0`. Its initial `cargo test --locked` could not start: the tagged lockfile records workspace versions as `0.0.0`, while the manifests declare `0.169.0`. `cargo update --workspace --offline` normalized that temporary worktree's lockfile using Cargo; all **1,310 external package records are identical**. Stock source remains unchanged. The normalized, locked stock test is compiling at this checkpoint.
+
+Continuation logs, exact commands, heads, durations and lockfile audit are under `C:/tmp/sig/fork-roll-0169c-gates/` (`results.jsonl`, `stock-lock-audit.json`, `stock-lock-normalization.diff`). Later gates and release remain pending. Tests use an isolated `CODEX_HOME`, no API-key environment variables, and their local mock fixtures.
